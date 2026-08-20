@@ -1,6 +1,7 @@
 .DS_Store
 *.swp
 *.csv
+*.svg
 .venv
 venv
 __pycache__/
