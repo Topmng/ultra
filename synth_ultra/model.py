@@ -11,6 +11,7 @@ _EPS = 1e-12
 _MIN_PRICE = 1e-8
 _MIN_SIGMA = 3e-5
 _MAX_SIGMA = 2e-2
+_WIDTH_SCALE = 10 ** 0.5
 
 
 def _sanitize(x: np.ndarray) -> np.ndarray:
@@ -37,7 +38,7 @@ def predict_percentiles(payload: dict) -> np.ndarray:
     sigma = 0.85 * vol_10s + 0.15 * max(f["spread_rel"], 0.0)
     if f["stale_ms"] > 250.0:
         sigma *= 1.0 + min(f["stale_ms"] / 1000.0, 1.0)
-    sigma = float(np.clip(sigma, _MIN_SIGMA, _MAX_SIGMA))
+    sigma = float(np.clip(sigma, _MIN_SIGMA, _MAX_SIGMA)) * _WIDTH_SCALE
 
     mu = (
         0.18 * f["top_obi"] * sigma
