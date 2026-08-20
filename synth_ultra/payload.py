@@ -146,7 +146,8 @@ def _load_candles_csv(path_str: str) -> dict[str, np.ndarray] | None:
     path = Path(path_str)
     if not path.is_file():
         return None
-    arr = np.loadtxt(path, delimiter=",", skiprows=1, usecols=(0, 1, 2, 3, 4, 5))
+    # open_time_ms, open_time_utc, open, high, low, close, volume
+    arr = np.loadtxt(path, delimiter=",", skiprows=1, usecols=(0, 2, 3, 4, 5, 6))
     if arr.ndim == 1:
         arr = arr.reshape(1, -1)
     return {
@@ -246,6 +247,14 @@ def default_current_time_ms() -> int:
     if times:
         return min(times)
     return 1_700_000_000_000
+
+
+def preload_venue_csvs() -> None:
+    """Read candle and trade CSVs into the loader cache."""
+    for path in (SPOT_CANDLES_CSV, FUTURES_CANDLES_CSV):
+        _load_candles_csv(str(path))
+    for path in (SPOT_TRADES_CSV, FUTURES_TRADES_CSV):
+        _load_trades_csv(str(path))
 
 
 def _venue(

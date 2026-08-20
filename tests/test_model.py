@@ -15,7 +15,7 @@ from synth_ultra.payload import (
     payload_to_jsonable,
 )
 from synth_ultra.scoring import pinball_crps, spot_microprice
-from synth_ultra.validate import check_output, run_once, validate
+from synth_ultra.validate import backtest_anchors, check_output, run_once, validate
 
 
 def test_quantile_grid_matches_spec():
@@ -130,6 +130,16 @@ def test_crps_perfect_forecast_is_low():
 
 def test_microprice_formula():
     assert spot_microprice(100.0, 1.0, 102.0, 3.0) == pytest.approx(100.5)
+
+
+def test_backtest_anchors_match_example_window():
+    start = 1_787_208_024_000
+    times = backtest_anchors(start, interval_s=1, length=60)
+    assert len(times) == 60
+    assert times[0] == start
+    assert times[1] == start + 1000
+    assert times[-1] == start + 59_000
+    assert times[-1] + 1000 == start + 60_000
 
 
 def test_validate_report_keys():
