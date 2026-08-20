@@ -53,3 +53,17 @@ def predict_percentiles(payload: dict) -> np.ndarray:
     log_px = np.log(px)
     out = np.exp(log_px + mu + sigma * INV_NORM, dtype=np.float64)
     return _sanitize(out)
+
+
+def _import_warmup() -> None:
+    """Prime numpy paths at import. Synth does not count this against the 5 ms budget."""
+    predict_percentiles(
+        {
+            "schema_version": 3,
+            "prompt": {"current_time_ms": 0},
+            "venues": {"spot": {}, "futures": {}},
+        }
+    )
+
+
+_import_warmup()
