@@ -5,6 +5,9 @@ Writes:
   btc_futures_candles.csv   USDT-M futures 1s OHLCV (from aggTrades; fapi has no 1s kline)
   btc_spot_trades.csv       spot aggregate trade history
   btc_futures_trades.csv    USDT-M futures aggregate trade history
+
+Each millisecond timestamp is followed by its UTC datetime
+(`2026-08-19 10:40:55.065+00:00`).
 """
 
 from __future__ import annotations
@@ -47,8 +50,16 @@ TIMEOUT_S = 30
 MAX_RETRIES = 5
 HEADERS = {"Accept": "*/*", "User-Agent": "synth-ultra-binance-fetch/1.0"}
 
-CANDLE_FIELDS = ("open_time_ms", "open", "high", "low", "close", "volume")
-TRADE_FIELDS = ("agg_trade_id", "ts_ms", "price", "qty", "buyer_is_maker")
+CANDLE_FIELDS = (
+    "open_time_ms",
+    "open_time_utc",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+)
+TRADE_FIELDS = ("agg_trade_id", "ts_ms", "ts_utc", "price", "qty", "buyer_is_maker")
 
 Trade = tuple[int, int, float, float, bool]
 
@@ -130,6 +141,13 @@ def _to_ms(ts: int) -> int:
     if ts >= 10**15:
         return ts // 1000
     return ts
+
+
+def ms_to_utc(ms: int) -> str:
+    """UTC datetime next to each millisecond timestamp: 2026-08-19 10:40:55.065+00:00."""
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).isoformat(
+        sep=" ", timespec="milliseconds"
+    )
 
 
 def _parse_zip_trade(row: list[str]) -> Trade | None:
@@ -285,6 +303,7 @@ def aggtrades_to_1s_ohlcv(trades: list[Trade], start_ms: int, n: int) -> list[di
             out.append(
                 {
                     "open_time_ms": open_time,
+                    "open_time_utc": ms_to_utc(open_time),
                     "open": prev_close,
                     "high": prev_close,
                     "low": prev_close,
@@ -296,6 +315,7 @@ def aggtrades_to_1s_ohlcv(trades: list[Trade], start_ms: int, n: int) -> list[di
             out.append(
                 {
                     "open_time_ms": open_time,
+                    "open_time_utc": ms_to_utc(open_time),
                     "open": candle[0],
                     "high": candle[1],
                     "low": candle[2],
@@ -311,6 +331,7 @@ def klines_to_ohlcv(rows: list[list]) -> list[dict[str, str | int | float]]:
     return [
         {
             "open_time_ms": int(row[0]),
+            "open_time_utc": ms_to_utc(int(row[0])),
             "open": float(row[1]),
             "high": float(row[2]),
             "low": float(row[3]),
@@ -326,6 +347,7 @@ def trades_to_rows(trades: list[Trade]) -> list[dict[str, str | int | float]]:
         {
             "agg_trade_id": trade_id,
             "ts_ms": ts,
+            "ts_utc": ms_to_utc(ts),
             "price": price,
             "qty": qty,
             "buyer_is_maker": buyer_is_maker,
@@ -347,9 +369,9 @@ def _print_candles(path: Path, candles: list[dict[str, str | int | float]]) -> N
     last = candles[-1]
     print(
         f"Wrote {len(candles)} rows to {path.resolve()}\n"
-        f"  first open_time_ms={first['open_time_ms']}  OHLCV="
+        f"  first open_time_ms={first['open_time_ms']}  utc={first['open_time_utc']}  OHLCV="
         f"{first['open']},{first['high']},{first['low']},{first['close']},{first['volume']}\n"
-        f"  last  open_time_ms={last['open_time_ms']}  OHLCV="
+        f"  last  open_time_ms={last['open_time_ms']}  utc={last['open_time_utc']}  OHLCV="
         f"{last['open']},{last['high']},{last['low']},{last['close']},{last['volume']}"
     )
 
@@ -359,9 +381,9 @@ def _print_trades(path: Path, rows: list[dict[str, str | int | float]]) -> None:
     last = rows[-1]
     print(
         f"Wrote {len(rows)} rows to {path.resolve()}\n"
-        f"  first ts_ms={first['ts_ms']}  id={first['agg_trade_id']}  "
+        f"  first ts_ms={first['ts_ms']}  utc={first['ts_utc']}  id={first['agg_trade_id']}  "
         f"price={first['price']} qty={first['qty']} maker={first['buyer_is_maker']}\n"
-        f"  last  ts_ms={last['ts_ms']}  id={last['agg_trade_id']}  "
+        f"  last  ts_ms={last['ts_ms']}  utc={last['ts_utc']}  id={last['agg_trade_id']}  "
         f"price={last['price']} qty={last['qty']} maker={last['buyer_is_maker']}"
     )
 
