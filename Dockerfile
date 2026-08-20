@@ -1,27 +1,14 @@
-# CPU-only Synth Ultra submission image.
-# Inference has no network; the payload is the only input.
-# Official base image / entrypoint may change when Synth publishes them.
+# Synth Ultra submission image.
+# Synth's serving loop imports VHFT_MINER_ENTRYPOINT and calls predict_percentiles.
+# Build for the evaluation platform:
+#   docker build --platform linux/amd64 -t synth-ultra:v1 .
 
-FROM python:3.12-slim-bookworm
+FROM --platform=linux/amd64 ghcr.io/synthdataco/vhft-miner-base:v1
+# Frozen digest for this round (optional pin):
+# FROM --platform=linux/amd64 ghcr.io/synthdataco/vhft-miner-base@sha256:47e3a095ae495dec695bc69ba613725e9e83fc7855bf97e7a3f35179a5e1c25d
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+ENV PYTHONPATH=/app \
+    VHFT_MINER_ENTRYPOINT=synth_ultra.model
 
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY synth_ultra ./synth_ultra
-COPY model.py .
-
-RUN python -m synth_ultra.validate --strict --rounds 32 --warmup 8
-
-USER 65534:65534
-
-EXPOSE 8080
-
-CMD ["python", "-m", "synth_ultra.runtime"]
+COPY synth_ultra/ /app/synth_ultra/
+COPY model.py /app/model.py

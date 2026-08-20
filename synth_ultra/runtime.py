@@ -1,8 +1,8 @@
-"""Optional in-process HTTP runtime for local Docker tests.
+"""Optional in-process HTTP runtime for local tests only.
 
-The evaluation contract is the Python function `predict_percentiles`.
-This server exists so you can `docker run` the image and POST pickle payloads.
-It is not used at scoring time unless Synth's unpublished entrypoint requires it.
+The submitted image uses Synth's base serving loop
+(``VHFT_MINER_ENTRYPOINT=synth_ultra.model``). This server is not copied
+into the image.
 """
 
 from __future__ import annotations

@@ -12,8 +12,21 @@ __pycache__
 htmlcov
 tests
 examples
+client
+binance_fetch.py
+fetch_binance.py
+requirements.txt
 requirements-dev.txt
+pyproject.toml
 *.md
 *.csv
 .DS_Store
 *.swp
+
+# Local harnesses — not part of the Synth serving contract
+synth_ultra/runtime.py
+synth_ultra/payload.py
+synth_ultra/validate.py
+synth_ultra/scoring.py
+synth_ultra/example.py
+synth_ultra/__main__.py

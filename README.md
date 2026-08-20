@@ -10,9 +10,6 @@ order flow, and extracting the best estimate of the current price from deep,
 fast-moving crypto order books — with models that feed directly into Synth's
 trading systems.
 
-## Git Repo
-https://github.com/bironlozano15-maker/synth-ultra.git
-
 ## What you build
 
 A model that:
@@ -53,19 +50,17 @@ shortest market horizons, where HFT firms operate.
 
 ## This repository
 
-A CPU-only submission image that implements the `predict_percentiles` contract
-from [`SPECIFICATION.md`](SPECIFICATION.md) and consumes the payload in
-[`input.md`](input.md).
+A CPU-only miner that implements the `predict_percentiles` contract from
+[`SPECIFICATION.md`](SPECIFICATION.md) and consumes the payload in
+[`input.md`](input.md):
 
-```
-predict_percentiles(payload: dict) -> np.ndarray  # shape (100,), float64
+```python
+def predict_percentiles(payload: dict) -> np.ndarray  # shape (100,), float64
 ```
 
-The baseline model estimates the current spot microprice from book-ticker,
-adds a short-horizon drift from order-book imbalance, trade flow, and
-futures–spot basis, then emits lognormal percentiles on the centered grid
-`q_i = (2i − 1) / 200`. Futures 1-second candles are ignored while
-`complete_history` is false (spot candles are used instead).
+The submission image is built `FROM` `ghcr.io/synthdataco/vhft-miner-base:v1`
+and sets `VHFT_MINER_ENTRYPOINT=synth_ultra.model`. Synth's serving loop imports
+that module and calls `predict_percentiles`. numpy is already in the base image.
 
 ### Local run
 
@@ -85,9 +80,46 @@ python binance_fetch.py
 python binance_fetch.py --only spot-trades
 ```
 
-### Docker image
+### Build the submission image
+
+Target `linux/amd64` (the evaluation platform). Run from the repo root:
 
 ```powershell
-docker build -t synth-ultra:latest .
-docker run --rm --network=none --cpus=1 --memory=512m synth-ultra:latest python -m synth_ultra.validate --strict
+docker build --platform linux/amd64 -t synth-ultra:v1 .
 ```
+
+Confirm the entrypoint is importable:
+
+```powershell
+docker run --rm --platform linux/amd64 --network=none --entrypoint python synth-ultra:v1 -c "from synth_ultra.model import predict_percentiles; print(predict_percentiles)"
+```
+
+### Submit to Synth
+
+Push the image to the private registry repository Synth gave you at onboarding,
+then submit the **digest** with [`client/submit.py`](client/submit.py). Replace
+`<your-registry-repo>`, wallet, and hotkey with your onboarding values.
+
+```powershell
+docker tag synth-ultra:v1 <your-registry-repo>/miner:v1
+docker push <your-registry-repo>/miner:v1
+```
+
+Copy the `sha256:...` digest printed by `docker push`, then:
+
+```powershell
+uv run --no-project --with "bittensor>=11,<12" python client/submit.py submit `
+  --wallet my_coldkey --hotkey my_hotkey `
+  --image-uri <your-registry-repo>/miner `
+  --image-digest sha256:<digest-from-docker-push> --version 1
+```
+
+Check status:
+
+```powershell
+uv run --no-project --with "bittensor>=11,<12" python client/submit.py status `
+  --wallet my_coldkey --hotkey my_hotkey
+```
+
+Limits: one submission per hotkey every 4 hours; each version must be strictly
+newer than the last. Full flow: [`FAQ.md`](FAQ.md).
