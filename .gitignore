@@ -13,3 +13,5 @@ __pycache__/
 htmlcov/
 dist/
 build/
+*push-key.json
+vhft-daniel-bruno-push-key.json
