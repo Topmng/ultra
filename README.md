@@ -2,6 +2,8 @@
 https://github.com/bironlozano15-maker/synth-ultra.git
 
 # How to submit model to synth
+*PERAPATION*: activate virtual python/bittensor environment and install docker if it was not installed yet. -> apt install docker.io
+
 1. docker build --platform linux/amd64 -t synth-ultra:v1 .
 
 2. docker run --rm --platform linux/amd64 --network=none --entrypoint python synth-ultra:v1 -c "from synth_ultra.model import predict_percentiles; print(predict_percentiles)"
