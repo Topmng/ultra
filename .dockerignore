@@ -21,6 +21,7 @@ requirements-dev.txt
 pyproject.toml
 *.md
 *.csv
+*.npz
 .DS_Store
 *.swp
 *push-key.json

@@ -11,7 +11,7 @@ _EPS = 1e-12
 _MIN_PRICE = 1e-8
 _MIN_SIGMA = 3e-5
 _MAX_SIGMA = 2e-2
-_WIDTH_SCALE = 10 ** 0.5
+_WIDTH_SCALE = 1.0
 
 
 def _sanitize(x: np.ndarray) -> np.ndarray:

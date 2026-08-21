@@ -161,19 +161,94 @@ def _depth_updates(
     return updates
 
 
+def _npz_path(src: Path) -> Path:
+    return src.with_name(src.name + ".npz")
+
+
+def _npz_fresh(src: Path, cache: Path) -> bool:
+    try:
+        return cache.is_file() and cache.stat().st_mtime >= src.stat().st_mtime
+    except OSError:
+        return False
+
+
+def _try_npz(src: Path) -> dict[str, np.ndarray] | None:
+    cache = _npz_path(src)
+    if not _npz_fresh(src, cache):
+        return None
+    try:
+        with np.load(cache) as packed:
+            return {name: np.asarray(packed[name]) for name in packed.files}
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _write_npz(src: Path, arrays: dict[str, np.ndarray]) -> None:
+    cache = _npz_path(src)
+    tmp = cache.with_name(cache.name + ".building.npz")
+    try:
+        np.savez(tmp, **arrays)
+        tmp.replace(cache)
+    except OSError:
+        if tmp.is_file():
+            tmp.unlink(missing_ok=True)
+
+
+def _empty_trades() -> dict[str, np.ndarray]:
+    return {
+        "ts_ms": np.array([], dtype=np.int64),
+        "price": np.array([], dtype=np.float64),
+        "qty": np.array([], dtype=np.float64),
+        "buyer_is_maker": np.array([], dtype=bool),
+    }
+
+
+def _parse_maker_column(path: Path, n: int) -> np.ndarray:
+    maker = np.empty(n, dtype=bool)
+    with path.open("rb") as handle:
+        handle.readline()
+        i = 0
+        for line in handle:
+            if not line.strip():
+                continue
+            token = line.rsplit(b",", 1)[-1].lstrip()[:1]
+            maker[i] = token in b"Tt1"
+            i += 1
+            if i >= n:
+                break
+    if i < n:
+        return maker[:i]
+    return maker
+
+
 @functools.lru_cache(maxsize=8)
 def _load_candles_csv(path_str: str) -> dict[str, np.ndarray] | None:
     path = Path(path_str)
     if not path.is_file():
         return None
-    # open_time_ms, open_time_utc, open, high, low, close, volume
-    arr = np.loadtxt(path, delimiter=",", skiprows=1, usecols=(0, 2, 3, 4, 5, 6))
+    cached = _try_npz(path)
+    if cached is not None and "open_time_ms" in cached and "ohlcv" in cached:
+        return {
+            "open_time_ms": cached["open_time_ms"].astype(np.int64, copy=False),
+            "ohlcv": cached["ohlcv"].astype(np.float64, copy=False),
+        }
+    try:
+        arr = np.loadtxt(path, delimiter=",", skiprows=1, usecols=(0, 2, 3, 4, 5, 6))
+    except Exception:
+        return None
+    if arr.size == 0:
+        return {
+            "open_time_ms": np.array([], dtype=np.int64),
+            "ohlcv": np.zeros((0, 5), dtype=np.float64),
+        }
     if arr.ndim == 1:
         arr = arr.reshape(1, -1)
-    return {
+    out = {
         "open_time_ms": arr[:, 0].astype(np.int64, copy=False),
         "ohlcv": arr[:, 1:6].astype(np.float64, copy=False),
     }
+    _write_npz(path, out)
+    return out
 
 
 @functools.lru_cache(maxsize=8)
@@ -181,27 +256,32 @@ def _load_trades_csv(path_str: str) -> dict[str, np.ndarray] | None:
     path = Path(path_str)
     if not path.is_file():
         return None
-    raw = np.genfromtxt(path, delimiter=",", names=True, dtype=None, encoding="utf-8")
-    if raw.size == 0:
+    cached = _try_npz(path)
+    if cached is not None and "ts_ms" in cached:
         return {
-            "ts_ms": np.array([], dtype=np.int64),
-            "price": np.array([], dtype=np.float64),
-            "qty": np.array([], dtype=np.float64),
-            "buyer_is_maker": np.array([], dtype=bool),
+            "ts_ms": cached["ts_ms"].astype(np.int64, copy=False),
+            "price": cached["price"].astype(np.float64, copy=False),
+            "qty": cached["qty"].astype(np.float64, copy=False),
+            "buyer_is_maker": cached["buyer_is_maker"].astype(bool, copy=False),
         }
-    maker = raw["buyer_is_maker"]
-    if maker.dtype.kind in ("U", "S", "O"):
-        maker_bool = np.array(
-            [str(x).strip().lower() in ("true", "1") for x in maker], dtype=bool
-        )
-    else:
-        maker_bool = np.asarray(maker, dtype=bool)
-    return {
-        "ts_ms": np.asarray(raw["ts_ms"], dtype=np.int64),
-        "price": np.asarray(raw["price"], dtype=np.float64),
-        "qty": np.asarray(raw["qty"], dtype=np.float64),
-        "buyer_is_maker": maker_bool,
+    try:
+        numeric = np.loadtxt(path, delimiter=",", skiprows=1, usecols=(1, 3, 4), dtype=np.float64)
+    except Exception:
+        return _empty_trades()
+    if numeric.size == 0:
+        return _empty_trades()
+    if numeric.ndim == 1:
+        numeric = numeric.reshape(1, -1)
+    maker = _parse_maker_column(path, numeric.shape[0])
+    n = min(numeric.shape[0], maker.size)
+    out = {
+        "ts_ms": numeric[:n, 0].astype(np.int64, copy=False),
+        "price": numeric[:n, 1].astype(np.float64, copy=False),
+        "qty": numeric[:n, 2].astype(np.float64, copy=False),
+        "buyer_is_maker": maker[:n],
     }
+    _write_npz(path, out)
+    return out
 
 
 def _window_slice(times: np.ndarray, lo_exclusive: int, hi_inclusive: int) -> slice:
@@ -271,6 +351,9 @@ def _load_book_ticker_csv(path_str: str) -> dict[str, np.ndarray] | None:
     path = Path(path_str)
     if not path.is_file():
         return None
+    cached = _try_npz(path)
+    if cached is not None and "recv_ts_ms" in cached:
+        return cached
     with path.open(newline="", encoding="utf-8") as handle:
         header = handle.readline()
     if not header.strip():
@@ -288,24 +371,20 @@ def _load_book_ticker_csv(path_str: str) -> dict[str, np.ndarray] | None:
     except Exception:
         return None
     if arr.size == 0:
-        return {
+        out: dict[str, np.ndarray] = {
             "recv_ts_ms": np.array([], dtype=np.int64),
             "bid_price": np.array([], dtype=np.float64),
             "bid_qty": np.array([], dtype=np.float64),
             "ask_price": np.array([], dtype=np.float64),
             "ask_qty": np.array([], dtype=np.float64),
-            **(
-                {
-                    "event_ts_ms": np.array([], dtype=np.int64),
-                    "transaction_ts_ms": np.array([], dtype=np.int64),
-                }
-                if extra
-                else {}
-            ),
         }
+        if extra:
+            out["event_ts_ms"] = np.array([], dtype=np.int64)
+            out["transaction_ts_ms"] = np.array([], dtype=np.int64)
+        return out
     if arr.ndim == 1:
         arr = arr.reshape(1, -1)
-    out: dict[str, np.ndarray] = {
+    out = {
         "recv_ts_ms": arr[:, 0].astype(np.int64, copy=False),
         "bid_price": arr[:, 1].astype(np.float64, copy=False),
         "bid_qty": arr[:, 2].astype(np.float64, copy=False),
@@ -314,6 +393,7 @@ def _load_book_ticker_csv(path_str: str) -> dict[str, np.ndarray] | None:
     }
     for i, name in enumerate(extra, start=5):
         out[name] = arr[:, i].astype(np.int64, copy=False)
+    _write_npz(path, out)
     return out
 
 
@@ -403,24 +483,43 @@ def _load_book_depth_csv(path_str: str) -> dict[str, np.ndarray] | None:
     path = Path(path_str)
     if not path.is_file():
         return None
-    try:
-        arr = np.loadtxt(path, delimiter=",", skiprows=1, usecols=(0, 2, 3, 4))
-    except Exception:
-        return None
-    if arr.size == 0:
-        return None
-    if arr.ndim == 1:
-        arr = arr.reshape(1, -1)
-    times = arr[:, 0].astype(np.int64, copy=False)
-    uniq, starts = np.unique(times, return_index=True)
+    cached = _try_npz(path)
+    if cached is not None and "ts_ms" in cached:
+        arr_ts = cached["ts_ms"].astype(np.int64, copy=False)
+        percentage = cached["percentage"].astype(np.float64, copy=False)
+        depth = cached["depth"].astype(np.float64, copy=False)
+        notional = cached["notional"].astype(np.float64, copy=False)
+    else:
+        try:
+            arr = np.loadtxt(path, delimiter=",", skiprows=1, usecols=(0, 2, 3, 4))
+        except Exception:
+            return None
+        if arr.size == 0:
+            return None
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        arr_ts = arr[:, 0].astype(np.int64, copy=False)
+        percentage = arr[:, 1].astype(np.float64, copy=False)
+        depth = arr[:, 2].astype(np.float64, copy=False)
+        notional = arr[:, 3].astype(np.float64, copy=False)
+        _write_npz(
+            path,
+            {
+                "ts_ms": arr_ts,
+                "percentage": percentage,
+                "depth": depth,
+                "notional": notional,
+            },
+        )
+    uniq, starts = np.unique(arr_ts, return_index=True)
     ends = np.empty_like(starts)
     ends[:-1] = starts[1:]
-    ends[-1] = times.size
+    ends[-1] = arr_ts.size
     return {
-        "ts_ms": times,
-        "percentage": arr[:, 1].astype(np.float64, copy=False),
-        "depth": arr[:, 2].astype(np.float64, copy=False),
-        "notional": arr[:, 3].astype(np.float64, copy=False),
+        "ts_ms": arr_ts,
+        "percentage": percentage,
+        "depth": depth,
+        "notional": notional,
         "uniq_ts": uniq,
         "starts": starts,
         "ends": ends,
@@ -447,53 +546,153 @@ def _snapshot_from_book_depth(table: dict[str, np.ndarray], t_ms: int, *, future
     }
 
 
+def _encode_depth_snaps(snaps: list[dict]) -> dict[str, np.ndarray]:
+    n = len(snaps)
+    recv = np.empty(n, dtype=np.int64)
+    uid = np.empty(n, dtype=np.int64)
+    event = np.empty(n, dtype=np.int64)
+    tx = np.empty(n, dtype=np.int64)
+    bid_off = np.empty(n, dtype=np.int64)
+    bid_n = np.empty(n, dtype=np.int32)
+    ask_off = np.empty(n, dtype=np.int64)
+    ask_n = np.empty(n, dtype=np.int32)
+    bid_parts: list[np.ndarray] = []
+    ask_parts: list[np.ndarray] = []
+    bo = 0
+    ao = 0
+    for i, snap in enumerate(snaps):
+        recv[i] = int(snap["recv_ts_ms"])
+        uid[i] = int(snap["update_id"])
+        event[i] = -1 if snap["event_ts_ms"] is None else int(snap["event_ts_ms"])
+        tx[i] = -1 if snap["transaction_ts_ms"] is None else int(snap["transaction_ts_ms"])
+        bids = np.asarray(snap["bids"], dtype=np.float64).reshape(-1, 2)
+        asks = np.asarray(snap["asks"], dtype=np.float64).reshape(-1, 2)
+        bid_off[i] = bo
+        bid_n[i] = bids.shape[0]
+        ask_off[i] = ao
+        ask_n[i] = asks.shape[0]
+        if bids.size:
+            bid_parts.append(bids)
+        if asks.size:
+            ask_parts.append(asks)
+        bo += bids.shape[0]
+        ao += asks.shape[0]
+    return {
+        "recv_ts_ms": recv,
+        "update_id": uid,
+        "event_ts_ms": event,
+        "transaction_ts_ms": tx,
+        "bid_off": bid_off,
+        "bid_n": bid_n,
+        "ask_off": ask_off,
+        "ask_n": ask_n,
+        "bids": np.vstack(bid_parts) if bid_parts else np.zeros((0, 2), dtype=np.float64),
+        "asks": np.vstack(ask_parts) if ask_parts else np.zeros((0, 2), dtype=np.float64),
+    }
+
+
+def _decode_depth_snaps(cached: dict[str, np.ndarray]) -> list[dict]:
+    recv = cached["recv_ts_ms"]
+    bids_all = cached["bids"]
+    asks_all = cached["asks"]
+    snaps: list[dict] = []
+    for i in range(recv.size):
+        b0 = int(cached["bid_off"][i])
+        bn = int(cached["bid_n"][i])
+        a0 = int(cached["ask_off"][i])
+        an = int(cached["ask_n"][i])
+        bids = bids_all[b0 : b0 + bn] if bn else np.zeros((0, 2), dtype=np.float64)
+        asks = asks_all[a0 : a0 + an] if an else np.zeros((0, 2), dtype=np.float64)
+        ev = int(cached["event_ts_ms"][i])
+        tx = int(cached["transaction_ts_ms"][i])
+        snaps.append(
+            {
+                "recv_ts_ms": np.int64(recv[i]),
+                "update_id": int(cached["update_id"][i]),
+                "bids": bids,
+                "asks": asks,
+                "event_ts_ms": None if ev < 0 else ev,
+                "transaction_ts_ms": None if tx < 0 else tx,
+            }
+        )
+    return snaps
+
+
+def _parse_depth_snapshot_csv(path: Path) -> list[dict] | None:
+    recv_l: list[int] = []
+    uid_l: list[int] = []
+    event_l: list[int | None] = []
+    tx_l: list[int | None] = []
+    is_bid_l: list[bool] = []
+    level_l: list[int] = []
+    price_l: list[float] = []
+    qty_l: list[float] = []
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, None)
+        if not header:
+            return None
+        for row in reader:
+            if len(row) < 9:
+                continue
+            recv_l.append(int(row[0]))
+            uid_l.append(int(float(row[2] or 0)))
+            event_l.append(_opt_int(row[3]))
+            tx_l.append(_opt_int(row[4]))
+            is_bid_l.append(str(row[5]).lower().startswith("b"))
+            level_l.append(int(row[6]))
+            price_l.append(float(row[7]))
+            qty_l.append(float(row[8]))
+    if not recv_l:
+        return None
+    recv = np.asarray(recv_l, dtype=np.int64)
+    bounds = np.concatenate(([0], np.flatnonzero(recv[1:] != recv[:-1]) + 1, [recv.size]))
+    snaps: list[dict] = []
+    for i in range(bounds.size - 1):
+        lo = int(bounds[i])
+        hi = int(bounds[i + 1])
+        bids: list[tuple[int, float, float]] = []
+        asks: list[tuple[int, float, float]] = []
+        for j in range(lo, hi):
+            item = (level_l[j], price_l[j], qty_l[j])
+            if is_bid_l[j]:
+                bids.append(item)
+            else:
+                asks.append(item)
+        bid_arr = (
+            np.array([[p, q] for _, p, q in sorted(bids)], dtype=np.float64)
+            if bids
+            else np.zeros((0, 2), dtype=np.float64)
+        )
+        ask_arr = (
+            np.array([[p, q] for _, p, q in sorted(asks)], dtype=np.float64)
+            if asks
+            else np.zeros((0, 2), dtype=np.float64)
+        )
+        snaps.append(
+            {
+                "recv_ts_ms": np.int64(recv[lo]),
+                "update_id": int(uid_l[lo]),
+                "bids": bid_arr,
+                "asks": ask_arr,
+                "event_ts_ms": event_l[lo],
+                "transaction_ts_ms": tx_l[lo],
+            }
+        )
+    return snaps
+
+
 @functools.lru_cache(maxsize=4)
 def _load_depth_snapshot_csv(path_str: str) -> list[dict] | None:
     path = Path(path_str)
     if not path.is_file():
         return None
-    groups: dict[int, dict[str, Any]] = {}
-    order: list[int] = []
-    with path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            recv = int(row["recv_ts_ms"])
-            if recv not in groups:
-                groups[recv] = {
-                    "recv_ts_ms": np.int64(recv),
-                    "update_id": int(float(row["update_id"] or 0)),
-                    "event_ts_ms": _opt_int(row.get("event_ts_ms")),
-                    "transaction_ts_ms": _opt_int(row.get("transaction_ts_ms")),
-                    "bids": [],
-                    "asks": [],
-                }
-                order.append(recv)
-            level = (int(row["level"]), float(row["price"]), float(row["qty"]))
-            if str(row["side"]).startswith("bid"):
-                groups[recv]["bids"].append(level)
-            else:
-                groups[recv]["asks"].append(level)
-    if not order:
-        return None
-    snaps: list[dict] = []
-    for recv in order:
-        g = groups[recv]
-        bids = np.array([[p, q] for _, p, q in sorted(g["bids"])], dtype=np.float64)
-        asks = np.array([[p, q] for _, p, q in sorted(g["asks"])], dtype=np.float64)
-        if bids.size == 0:
-            bids = np.zeros((0, 2), dtype=np.float64)
-        if asks.size == 0:
-            asks = np.zeros((0, 2), dtype=np.float64)
-        snaps.append(
-            {
-                "recv_ts_ms": g["recv_ts_ms"],
-                "update_id": int(g["update_id"]),
-                "bids": bids,
-                "asks": asks,
-                "event_ts_ms": g["event_ts_ms"],
-                "transaction_ts_ms": g["transaction_ts_ms"],
-            }
-        )
+    cached = _try_npz(path)
+    if cached is not None and "recv_ts_ms" in cached and "bid_off" in cached:
+        return _decode_depth_snaps(cached)
+    snaps = _parse_depth_snapshot_csv(path)
+    if snaps:
+        _write_npz(path, _encode_depth_snaps(snaps))
     return snaps
 
 
@@ -619,17 +818,31 @@ def default_current_time_ms() -> int:
 
 def preload_venue_csvs() -> None:
     """Read candle, trade, book, and depth CSVs into the loader cache."""
-    for path in (SPOT_CANDLES_CSV, FUTURES_CANDLES_CSV):
-        _load_candles_csv(str(path))
-    for path in (SPOT_TRADES_CSV, FUTURES_TRADES_CSV):
-        _load_trades_csv(str(path))
-    for path in (SPOT_BOOK_TICKER_CSV, FUTURES_BOOK_TICKER_CSV):
-        _load_book_ticker_csv(str(path))
-    for path in (SPOT_DEPTH_CSV, FUTURES_DEPTH_CSV):
-        _load_depth_snapshot_csv(str(path))
-    _load_book_depth_csv(str(FUTURES_BOOK_DEPTH_CSV))
-    for path in (SPOT_DEPTH_UPDATES_JSONL, FUTURES_DEPTH_UPDATES_JSONL):
-        _load_depth_updates_jsonl(str(path))
+    import time
+
+    jobs: list[tuple[str, Path, Any]] = [
+        ("btc_spot_candles.csv", SPOT_CANDLES_CSV, _load_candles_csv),
+        ("btc_futures_candles.csv", FUTURES_CANDLES_CSV, _load_candles_csv),
+        ("btc_spot_trades.csv", SPOT_TRADES_CSV, _load_trades_csv),
+        ("btc_futures_trades.csv", FUTURES_TRADES_CSV, _load_trades_csv),
+        ("btc_spot_book_ticker.csv", SPOT_BOOK_TICKER_CSV, _load_book_ticker_csv),
+        ("btc_futures_book_ticker.csv", FUTURES_BOOK_TICKER_CSV, _load_book_ticker_csv),
+        ("btc_spot_depth.csv", SPOT_DEPTH_CSV, _load_depth_snapshot_csv),
+        ("btc_futures_depth.csv", FUTURES_DEPTH_CSV, _load_depth_snapshot_csv),
+        ("btc_futures_book_depth.csv", FUTURES_BOOK_DEPTH_CSV, _load_book_depth_csv),
+        ("btc_spot_depth_updates.jsonl", SPOT_DEPTH_UPDATES_JSONL, _load_depth_updates_jsonl),
+        ("btc_futures_depth_updates.jsonl", FUTURES_DEPTH_UPDATES_JSONL, _load_depth_updates_jsonl),
+    ]
+    total = 0.0
+    print("database load")
+    for name, path, loader in jobs:
+        t0 = time.perf_counter()
+        loader(str(path))
+        dt = time.perf_counter() - t0
+        total += dt
+        mb = path.stat().st_size / 1e6 if path.is_file() else 0.0
+        print(f"  {name:36s} {mb:7.1f} MB  {dt:7.3f} s")
+    print(f"  {'TOTAL':36s} {'':7s}     {total:7.3f} s")
 
 
 def _venue(

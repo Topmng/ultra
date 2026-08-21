@@ -348,19 +348,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--current-time-ms",
         type=int,
-        default=1787125260000,
+        default=1787106600000,
         help="first forecast anchor (ms); backtest starts here",
     )
     parser.add_argument(
         "--time-interval",
         type=int,
-        default=7,
+        default=11,
         help="seconds between consecutive anchors",
     )
     parser.add_argument(
         "--time-length",
         type=int,
-        default=36,
+        default=200,
         help="number of backtest anchors (e.g. 60 tests of 1s = 60s window)",
     )
     parser.add_argument(
