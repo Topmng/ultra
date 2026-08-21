@@ -15,6 +15,7 @@ examples
 client
 binance_fetch.py
 fetch_binance.py
+fetch_payload.py
 requirements.txt
 requirements-dev.txt
 pyproject.toml

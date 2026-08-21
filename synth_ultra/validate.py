@@ -22,7 +22,7 @@ from synth_ultra.constants import (
     QUANTILE_GRID,
 )
 from synth_ultra.model import predict_percentiles
-from synth_ultra.payload import make_sample_payload, preload_venue_csvs
+from synth_ultra.payload import ENV_PAYLOAD_JSON, load_payload, make_sample_payload, preload_venue_csvs
 from synth_ultra.scoring import pinball_crps, realized_spot_close
 
 PLOT_DIR = Path("plot")
@@ -197,6 +197,7 @@ def _validate_one(
     payload: dict,
     *,
     rounds: int,
+    allow_rest: bool = False,
 ) -> dict[str, Any]:
     times: list[float] = []
     first = None
@@ -206,11 +207,11 @@ def _validate_one(
     target = anchor + HORIZON_SECONDS * 1000
     for _ in range(rounds):
         out, elapsed = run_once(payload)
-        realized = realized_spot_close(anchor)
+        realized = realized_spot_close(anchor, allow_rest=allow_rest)
         if realized is None:
             raise ValidationError(
                 f"no spot candle close at current_time+{HORIZON_SECONDS}s "
-                f"({ms_to_utc(target)}) in btc_spot_candles.csv"
+                f"({ms_to_utc(target)}); need database/btc_spot_candles.csv or a live REST kline"
             )
         crps = pinball_crps(out, realized)
         if first is None:
@@ -250,35 +251,49 @@ def validate(
     current_time_ms: int | None = None,
     time_interval: int = 1,
     time_length: int = 1,
+    payload: dict | None = None,
+    allow_rest: bool = False,
     on_test: Callable[[int, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    # for _ in range(warmup):
-    #     run_once(payload)
     t_prep = time.perf_counter()
-    preload_venue_csvs()
+    if payload is None:
+        preload_venue_csvs()
     prepare_s = time.perf_counter() - t_prep
     if on_test is not None:
         print(f"prepare={prepare_s:.3f} s")
         sys.stdout.flush()
-    if current_time_ms is None:
-        start_ms = int(make_sample_payload(seed)["prompt"]["current_time_ms"])
-    else:
-        start_ms = int(current_time_ms)
-    anchors = backtest_anchors(start_ms, time_interval, time_length)
-    reports: list[dict[str, Any]] = []
-    all_times: list[float] = []
-    asset = "BTC"
-    for i, anchor in enumerate(anchors, start=1):
+    if payload is not None:
         t1 = time.perf_counter()
-        point_payload = make_sample_payload(seed, current_time_ms=anchor)
-        if i == 1:
-            asset = str(point_payload["prompt"]["asset"])
-        one = _validate_one(point_payload, rounds=rounds)
+        one = _validate_one(payload, rounds=rounds, allow_rest=allow_rest)
         one["elapsed_s"] = time.perf_counter() - t1
-        reports.append(one)
-        all_times.extend(one["predict_times_s"])
         if on_test is not None:
-            on_test(i, one)
+            on_test(1, one)
+        reports = [one]
+        all_times = list(one["predict_times_s"])
+        asset = str(payload["prompt"].get("asset") or "BTC")
+        start_ms = int(one["current_time_ms"])
+        time_interval = 0
+        time_length = 1
+    else:
+        if current_time_ms is None:
+            start_ms = int(make_sample_payload(seed)["prompt"]["current_time_ms"])
+        else:
+            start_ms = int(current_time_ms)
+        anchors = backtest_anchors(start_ms, time_interval, time_length)
+        reports = []
+        all_times = []
+        asset = "BTC"
+        for i, anchor in enumerate(anchors, start=1):
+            t1 = time.perf_counter()
+            point_payload = make_sample_payload(seed, current_time_ms=anchor)
+            if i == 1:
+                asset = str(point_payload["prompt"]["asset"])
+            one = _validate_one(point_payload, rounds=rounds, allow_rest=allow_rest)
+            one["elapsed_s"] = time.perf_counter() - t1
+            reports.append(one)
+            all_times.extend(one["predict_times_s"])
+            if on_test is not None:
+                on_test(i, one)
 
     median = statistics.median(all_times)
     p95 = statistics.quantiles(all_times, n=20)[18] if len(all_times) >= 20 else max(all_times)
@@ -353,6 +368,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="fail if median latency exceeds the 5 ms budget",
     )
+    parser.add_argument(
+        "--payload",
+        type=Path,
+        nargs="?",
+        const=ENV_PAYLOAD_JSON,
+        default=None,
+        help="score a saved payload JSON (default path if flag is bare: examples/env_payload.json)",
+    )
     args = parser.parse_args(argv)
 
     def on_test(i: int, one: dict[str, Any]) -> None:
@@ -378,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     try:
+        loaded = load_payload(args.payload) if args.payload is not None else None
         report = validate(
             warmup=args.warmup,
             rounds=args.rounds,
@@ -386,6 +410,8 @@ def main(argv: list[str] | None = None) -> int:
             current_time_ms=args.current_time_ms,
             time_interval=args.time_interval,
             time_length=args.time_length,
+            payload=loaded,
+            allow_rest=args.payload is not None,
             on_test=on_test,
         )
     except ValidationError as exc:

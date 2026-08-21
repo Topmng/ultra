@@ -9,7 +9,8 @@ from pathlib import Path
 import numpy as np
 
 from synth_ultra.model import predict_percentiles
-from synth_ultra.payload import make_sample_payload, payload_to_jsonable
+from synth_ultra.payload import ENV_PAYLOAD_JSON, load_payload, make_sample_payload, payload_to_jsonable
+from synth_ultra.scoring import pinball_crps, realized_spot_close
 from synth_ultra.validate import check_output
 
 
@@ -68,9 +69,20 @@ def main(argv: list[str] | None = None) -> int:
         help="write JSON payload to this path",
     )
     parser.add_argument("--no-save", action="store_true")
+    parser.add_argument(
+        "--payload",
+        type=Path,
+        nargs="?",
+        const=ENV_PAYLOAD_JSON,
+        default=None,
+        help="load this JSON instead of a synthetic sample (bare flag → examples/env_payload.json)",
+    )
     args = parser.parse_args(argv)
 
-    payload = make_sample_payload(args.seed, compact=not args.full)
+    if args.payload is not None:
+        payload = load_payload(args.payload)
+    else:
+        payload = make_sample_payload(args.seed, compact=not args.full)
     prompt = payload["prompt"]
     print("input prompt")
     print(json.dumps(prompt, indent=2))
@@ -78,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     summarize_venue("spot", payload["venues"]["spot"])
     summarize_venue("futures", payload["venues"]["futures"])
 
-    if not args.no_save:
+    if not args.no_save and args.payload is None:
         args.save.parent.mkdir(parents=True, exist_ok=True)
         args.save.write_text(
             json.dumps(payload_to_jsonable(payload), indent=2),
@@ -93,6 +105,19 @@ def main(argv: list[str] | None = None) -> int:
     print("q=0.995 (last) ", f"{out[-1]:.4f}")
     np.set_printoptions(precision=4, suppress=True, linewidth=100, threshold=100)
     print(out)
+
+    if args.payload is not None:
+        from synth_ultra.constants import HORIZON_SECONDS
+
+        anchor = int(prompt["current_time_ms"])
+        y = realized_spot_close(anchor, allow_rest=True)
+        if y is None:
+            print(
+                f"\nCRPS skipped: no spot 1s close at current_time+{HORIZON_SECONDS}s. "
+                "Wait 10s after capture, or keep btc_spot_candles.csv covering that instant."
+            )
+        else:
+            print(f"\nrealized_close={y:.4f}  CRPS={pinball_crps(out, y):.6f}")
     return 0
 
 

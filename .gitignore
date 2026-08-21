@@ -2,6 +2,8 @@
 *.swp
 *.csv
 *.svg
+*.json
+*.jsonl
 .venv
 venv
 __pycache__/

@@ -1,10 +1,7 @@
-"""Alias for binance_fetch.py — last 24h of BTCUSDT candles and trades.
+"""Alias for binance_fetch.py — 48h+ of BTCUSDT payload streams into database/.
 
-Writes:
-  btc_spot_candles.csv
-  btc_futures_candles.csv
-  btc_spot_trades.csv
-  btc_futures_trades.csv
+Resumes after each CSV's last timestamp. Writes candles, trades, book ticker,
+depth snapshots, depth updates, and futures bookDepth.
 """
 
 from binance_fetch import main
