@@ -1,4 +1,8 @@
-"""Print a sample payload and the model output. Useful before building Docker."""
+"""Inspect a sample or saved payload and the model output.
+
+    python inspect_payload.py
+    python inspect_payload.py --payload examples/env_payload.json
+"""
 
 from __future__ import annotations
 
@@ -75,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         nargs="?",
         const=ENV_PAYLOAD_JSON,
         default=None,
-        help="load this JSON instead of a synthetic sample (bare flag → examples/env_payload.json)",
+        help="load this JSON instead of a synthetic sample (bare flag: examples/env_payload.json)",
     )
     args = parser.parse_args(argv)
 
@@ -114,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
         if y is None:
             print(
                 f"\nCRPS skipped: no spot 1s close at current_time+{HORIZON_SECONDS}s. "
-                "Wait 10s after capture, or keep btc_spot_candles.csv covering that instant."
+                "Wait 10s after capture, or keep database/btc_spot_candles.csv covering that instant."
             )
         else:
             print(f"\nrealized_close={y:.4f}  CRPS={pinball_crps(out, y):.6f}")

@@ -1,8 +1,12 @@
-"""Local harness: schema load, output contract, latency budget."""
+"""Local harness: schema load, output contract, latency budget.
+
+Run the CLI from the repo root:
+
+    python test.py
+"""
 
 from __future__ import annotations
 
-import argparse
 import csv
 import statistics
 import sys
@@ -22,7 +26,7 @@ from synth_ultra.constants import (
     QUANTILE_GRID,
 )
 from synth_ultra.model import predict_percentiles
-from synth_ultra.payload import ENV_PAYLOAD_JSON, load_payload, make_sample_payload, preload_venue_csvs
+from synth_ultra.payload import make_sample_payload, preload_venue_csvs
 from synth_ultra.scoring import pinball_crps, realized_spot_close
 
 PLOT_DIR = Path("plot")
@@ -101,7 +105,7 @@ def backtest_anchors(start_ms: int, interval_s: int, length: int) -> list[int]:
     return [int(start_ms) + i * step_ms for i in range(length)]
 
 
-def _write_forecast_picture(
+def write_forecast_picture(
     path: Path,
     percentiles: np.ndarray,
     realized: float,
@@ -341,90 +345,13 @@ def validate(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Validate Synth Ultra model contract")
-    parser.add_argument("--rounds", type=int, default=1)
-    parser.add_argument("--warmup", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--current-time-ms",
-        type=int,
-        default=1787106600000,
-        help="first forecast anchor (ms); backtest starts here",
-    )
-    parser.add_argument(
-        "--time-interval",
-        type=int,
-        default=11,
-        help="seconds between consecutive anchors",
-    )
-    parser.add_argument(
-        "--time-length",
-        type=int,
-        default=200,
-        help="number of backtest anchors (e.g. 60 tests of 1s = 60s window)",
-    )
-    parser.add_argument(
-        "--strict",
-        action="store_true",
-        help="fail if median latency exceeds the 5 ms budget",
-    )
-    parser.add_argument(
-        "--payload",
-        type=Path,
-        nargs="?",
-        const=ENV_PAYLOAD_JSON,
-        default=None,
-        help="score a saved payload JSON (default path if flag is bare: examples/env_payload.json)",
-    )
-    args = parser.parse_args(argv)
+    """CLI lives in the repo-root ``test.py`` (`python test.py`)."""
+    import importlib.util
 
-    def on_test(i: int, one: dict[str, Any]) -> None:
-        print(f"=== test {i} ===")
-        print(
-            f"start={one['current_time_utc']}  "
-            f"target={one['target_utc']}  "
-            f"CRPS={one['crps']:.6f}"
-        )
-        print(
-            f"OK  output contract  "
-            f"predict={one['max_ms']:.3f} ms  "
-            f"elapsed={one['elapsed_s']:.3f} s"
-        )
-        sys.stdout.flush()
-        _write_forecast_picture(
-            forecast_svg_path(int(one["target_ms"])),
-            one["percentiles"],
-            float(one["realized_close"]),
-            one["current_time_utc"],
-            one["target_utc"],
-            float(one["crps"]),
-        )
-
-    try:
-        loaded = load_payload(args.payload) if args.payload is not None else None
-        report = validate(
-            warmup=args.warmup,
-            rounds=args.rounds,
-            seed=args.seed,
-            strict=args.strict,
-            current_time_ms=args.current_time_ms,
-            time_interval=args.time_interval,
-            time_length=args.time_length,
-            payload=loaded,
-            allow_rest=args.payload is not None,
-            on_test=on_test,
-        )
-    except ValidationError as exc:
-        print(f"FAIL: {exc}", file=sys.stderr)
-        return 1
-    print()
-    print(f"average CRPS={report['crps']:.6f}")
-    print(f"maximum predict time={report['max_ms']:.3f} ms")
-    crps_path = crps_csv_path(str(report["asset"]))
-    write_crps_csv(crps_path, report["reports"])
-    print(f"wrote {crps_path.resolve()}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    path = Path(__file__).resolve().parent.parent / "test.py"
+    spec = importlib.util.spec_from_file_location("synth_ultra_test_cli", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return int(module.main(argv))

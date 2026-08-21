@@ -13,9 +13,12 @@ htmlcov
 tests
 examples
 client
-binance_fetch.py
+fetch_history.py
 fetch_binance.py
+fetch_live.py
 fetch_payload.py
+inspect_payload.py
+test.py
 requirements.txt
 requirements-dev.txt
 pyproject.toml
@@ -32,5 +35,4 @@ synth_ultra/runtime.py
 synth_ultra/payload.py
 synth_ultra/validate.py
 synth_ultra/scoring.py
-synth_ultra/example.py
 synth_ultra/__main__.py

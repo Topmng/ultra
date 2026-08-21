@@ -1,0 +1,113 @@
+"""Local model backtest: latency, output contract, and CRPS.
+
+    python test.py
+    python test.py --time-length 20 --time-interval 11
+    python test.py --payload examples/env_payload.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from typing import Any
+
+from synth_ultra.payload import ENV_PAYLOAD_JSON, load_payload
+from synth_ultra.validate import (
+    ValidationError,
+    crps_csv_path,
+    forecast_svg_path,
+    validate,
+    write_crps_csv,
+    write_forecast_picture,
+)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Validate Synth Ultra model contract")
+    parser.add_argument("--rounds", type=int, default=1)
+    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--current-time-ms",
+        type=int,
+        default=1787106600000,
+        help="first forecast anchor (ms); backtest starts here",
+    )
+    parser.add_argument(
+        "--time-interval",
+        type=int,
+        default=11,
+        help="seconds between consecutive anchors",
+    )
+    parser.add_argument(
+        "--time-length",
+        type=int,
+        default=200,
+        help="number of backtest anchors (e.g. 60 tests of 1s = 60s window)",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="fail if median latency exceeds the 5 ms budget",
+    )
+    parser.add_argument(
+        "--payload",
+        type=Path,
+        nargs="?",
+        const=ENV_PAYLOAD_JSON,
+        default=None,
+        help="score a saved payload JSON (bare flag: examples/env_payload.json)",
+    )
+    args = parser.parse_args(argv)
+
+    def on_test(i: int, one: dict[str, Any]) -> None:
+        print(f"=== test {i} ===")
+        print(
+            f"start={one['current_time_utc']}  "
+            f"target={one['target_utc']}  "
+            f"CRPS={one['crps']:.6f}"
+        )
+        print(
+            f"OK  output contract  "
+            f"predict={one['max_ms']:.3f} ms  "
+            f"elapsed={one['elapsed_s']:.3f} s"
+        )
+        sys.stdout.flush()
+        write_forecast_picture(
+            forecast_svg_path(int(one["target_ms"])),
+            one["percentiles"],
+            float(one["realized_close"]),
+            one["current_time_utc"],
+            one["target_utc"],
+            float(one["crps"]),
+        )
+
+    try:
+        loaded = load_payload(args.payload) if args.payload is not None else None
+        report = validate(
+            warmup=args.warmup,
+            rounds=args.rounds,
+            seed=args.seed,
+            strict=args.strict,
+            current_time_ms=args.current_time_ms,
+            time_interval=args.time_interval,
+            time_length=args.time_length,
+            payload=loaded,
+            allow_rest=args.payload is not None,
+            on_test=on_test,
+        )
+    except ValidationError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+    print()
+    print(f"average CRPS={report['crps']:.6f}")
+    print(f"maximum predict time={report['max_ms']:.3f} ms")
+    crps_path = crps_csv_path(str(report["asset"]))
+    write_crps_csv(crps_path, report["reports"])
+    print(f"wrote {crps_path.resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

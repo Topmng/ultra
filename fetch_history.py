@@ -1,5 +1,7 @@
 """Fetch Binance BTCUSDT market data into database/ for Synth Ultra payloads.
 
+    python fetch_history.py
+
 Default window is trailing 48 hours (more than one payload-day). Existing CSVs
 are resumed after their last timestamp and backfilled so coverage stays >= 48h.
 

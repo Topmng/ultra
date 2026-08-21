@@ -1,10 +1,10 @@
-"""Alias for binance_fetch.py — 48h+ of BTCUSDT payload streams into database/.
+"""Alias for fetch_history.py — 48h+ of BTCUSDT payload streams into database/.
 
-Resumes after each CSV's last timestamp. Writes candles, trades, book ticker,
-depth snapshots, depth updates, and futures bookDepth.
+    python fetch_history.py
+    python fetch_binance.py
 """
 
-from binance_fetch import main
+from fetch_history import main
 
 if __name__ == "__main__":
     raise SystemExit(main())

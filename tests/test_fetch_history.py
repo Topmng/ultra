@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from binance_fetch import (
+from fetch_history import (
     CANDLE_FIELDS,
     _parse_book_depth_row,
     _parse_book_ticker_row,
