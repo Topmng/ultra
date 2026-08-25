@@ -33,12 +33,17 @@ the first call?**
   your model package in and set `VHFT_MINER_ENTRYPOINT` to your module:
 
   ```dockerfile
-  FROM ghcr.io/synthdataco/vhft-miner-base:v1   # stable, frozen tag for this round
+  FROM ghcr.io/synthdataco/vhft-miner-base:v2   # stable, frozen tag for this round
   # for a fully reproducible build, pin the digest instead:
-  # FROM ghcr.io/synthdataco/vhft-miner-base@sha256:47e3a095ae495dec695bc69ba613725e9e83fc7855bf97e7a3f35179a5e1c25d
+  # FROM ghcr.io/synthdataco/vhft-miner-base@sha256:66dbeb6f64cab66383333b1499b0fe45a186e5d7bf2f1ade2ddacc3342e1d6ca
   COPY my_model/ /app/my_model/
   ENV VHFT_MINER_ENTRYPOINT=my_model.model
   ```
+
+  `v2` is current, and `v2`'s serving loop recovers from a dropped connection by
+  waiting for the reconnect. `v1` remains published and works; if you built on it,
+  rebuilding on `v2` is worth doing whenever convenient. Nothing else changed — same
+  Python, same `numpy`/`msgpack`, same interface — so a rebuild is the only step.
 - Your entrypoint is an importable `package.module` (or `package.module:function`)
   exposing:
 
@@ -111,6 +116,22 @@ uv run --no-project --with "bittensor>=11,<12" python client/submit.py status \
 
 Your `<your-registry-repo>` URL, push credentials, and `docker login` command are
 provided by Synth at onboarding.
+
+**Reading your status.** The `status` command tells you both whether we accepted
+your image and whether it's actually running:
+
+- **`status`** — your latest submission: `pending` (awaiting review), `approved`,
+  or `rejected` (reason in `error`).
+- **`deploy_state`** — *why* it is or isn't live:
+  - `live` — deployed and scoring;
+  - `queued` — approved, waiting for a free slot;
+  - `not_registered` — approved, but your hotkey isn't registered on the Synth
+    subnet; register it and you'll deploy automatically;
+  - `pending_review` / `rejected` — mirrors the submission status.
+- **`live_digest`** — the image digest actually running for you (set only when `live`).
+
+So `approved` + `not_registered` means we accepted your image, but you still need a
+**registered subnet hotkey** before it can run.
 
 ## Payload semantics at a trade-triggered call
 
