@@ -41,12 +41,12 @@ def predict_percentiles(payload: dict) -> np.ndarray:
     sigma = float(np.clip(sigma, _MIN_SIGMA, _MAX_SIGMA)) * _WIDTH_SCALE
 
     mu = (
-        0.18 * f["top_obi"] * sigma
+        0.03 * f["top_obi"] * sigma
         + 0.12 * f["obi"] * sigma
-        + 0.16 * f["flow_fast"] * sigma
-        + 0.08 * f["flow"] * sigma
-        + 0.22 * f["momentum"]
-        + 0.10 * np.clip(f["basis"], -0.001, 0.001)
+        + 0.02 * f["flow_fast"] * sigma
+        + 0.02 * f["flow"] * sigma
+        + 0.14 * f["momentum"]
+        + 0.02 * np.clip(f["basis"], -0.001, 0.001)
     )
     mu = float(np.clip(mu, -4.0 * sigma, 4.0 * sigma))
 
