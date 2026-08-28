@@ -28,7 +28,7 @@ pyproject.toml
 .DS_Store
 *.swp
 *push-key.json
-vhft-daniel-bruno-push-key.json
+vhft-henry-bauer-push-key.json
 
 # Local harnesses — not part of the Synth serving contract
 synth_ultra/runtime.py

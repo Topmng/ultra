@@ -11,13 +11,13 @@ You need `bittensor` available. The simplest way, with no install, is uv:
   # submit (use YOUR wallet + hotkey, YOUR registry repo from onboarding, and the
   # digest that `docker push` printed):
   uv run --no-project --with "bittensor>=11,<12" python submit.py submit \
-    --wallet my_coldkey --hotkey my_hotkey \
-    --image-uri <your-registry-repo>/miner \
+    --wallet bt --hotkey default \
+    --image-uri asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner \
     --image-digest sha256:<digest-from-docker-push> --version 1
 
   # check status (signature-gated):
   uv run --no-project --with "bittensor>=11,<12" python submit.py status \
-    --wallet my_coldkey --hotkey my_hotkey
+    --wallet bt --hotkey default
 
 Identity options:
   --wallet <name> --hotkey <hk>   reads ~/.bittensor/wallets/<name>/hotkeys/<hk>
