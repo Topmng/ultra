@@ -139,6 +139,38 @@ def venue_vol_and_momentum(venue: dict | None) -> tuple[float, float]:
     return vol_1s, mom
 
 
+def _micro_series(book_ticker: dict | None) -> tuple[np.ndarray, np.ndarray]:
+    if not book_ticker:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
+    ts = np.asarray(book_ticker.get("recv_ts_ms", []), dtype=np.int64)
+    bid_p = _as_f64(book_ticker.get("bid_price"))
+    bid_q = _as_f64(book_ticker.get("bid_qty"))
+    ask_p = _as_f64(book_ticker.get("ask_price"))
+    ask_q = _as_f64(book_ticker.get("ask_qty"))
+    n = min(ts.size, bid_p.size, bid_q.size, ask_p.size, ask_q.size)
+    if n == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
+    bid_p, bid_q, ask_p, ask_q = bid_p[-n:], bid_q[-n:], ask_p[-n:], ask_q[-n:]
+    den = bid_q + ask_q
+    mid = 0.5 * (bid_p + ask_p)
+    micro = np.where(den > 0.0, (bid_p * ask_q + ask_p * bid_q) / np.where(den > 0.0, den, 1.0), mid)
+    return ts[-n:], micro.astype(np.float64, copy=False)
+
+
+def book_micro_vol(book_ticker: dict | None) -> float:
+    """EWMA vol of 1s-downsampled book-ticker microprice returns."""
+    ts, micro = _micro_series(book_ticker)
+    if ts.size < 2 or micro[-1] <= 0.0:
+        return 0.0
+    sec = ts // 1000
+    keep = np.empty(sec.size, dtype=bool)
+    keep[-1] = True
+    if sec.size > 1:
+        keep[:-1] = sec[1:] != sec[:-1]
+    rets = log_returns(micro[keep])
+    return ewma_vol(rets[-120:] if rets.size else rets)
+
+
 def last_event_age_ms(venue: dict | None, now_ms: int) -> float:
     if not venue:
         return 0.0
@@ -174,6 +206,10 @@ def extract(payload: dict) -> dict[str, float]:
     vol_1s = 0.6 * spot_vol + 0.4 * fut_vol if fut_vol > 0.0 else spot_vol
     mom = 0.5 * spot_mom + 0.5 * fut_mom
 
+    spot_mvol = book_micro_vol(spot.get("book_ticker"))
+    fut_mvol = book_micro_vol(fut.get("book_ticker"))
+    micro_vol_1s = 0.6 * spot_mvol + 0.4 * fut_mvol if fut_mvol > 0.0 else spot_mvol
+
     obi = 0.5 * depth_imbalance(spot.get("depth_latest")) + 0.5 * depth_imbalance(
         fut.get("depth_latest")
     )
@@ -201,6 +237,7 @@ def extract(payload: dict) -> dict[str, float]:
         "price": float(px),
         "mid": float(spot_mid if spot_mid > 0.0 else px),
         "vol_1s": float(vol_1s),
+        "micro_vol_1s": float(micro_vol_1s),
         "momentum": float(mom),
         "obi": float(obi),
         "top_obi": float(top_obi),

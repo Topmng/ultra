@@ -89,6 +89,30 @@ python client/submit.py status --wallet bt --hotkey live2
 
 **IMPORTANT:** every model update needs a new digest and a strictly higher `--version`. Synth allows one submission per hotkey every 4 hours. After approval, a registered hotkey typically goes live within about 2 minutes.
 
+Version 1 was submitted at `2026-08-28 19:02 UTC`. The next submit is allowed at about `23:02 UTC`. You can rebuild and push anytime; only the `submit.py submit` call is rate-limited.
+
+
+# Update after a model change (VPS)
+
+On `~/ultra/ultra`, with `.venv` active:
+
+```
+git pull
+docker build --platform linux/amd64 -t synth-ultra:v2 .
+docker run --rm --platform linux/amd64 --network=none --entrypoint python synth-ultra:v2 -c "from synth_ultra.model import predict_percentiles; print(predict_percentiles)"
+cat vhft-henry-bauer-push-key.json | docker login -u _json_key --password-stdin https://asia-northeast1-docker.pkg.dev
+docker tag synth-ultra:v2 asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner:v2
+docker push asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner:v2
+docker inspect --format='{{index .RepoDigests 0}}' asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner:v2
+```
+
+Then, only after the 4-hour window, submit `--version 2` with the new `sha256:` digest from inspect (no angle brackets):
+
+```
+python client/submit.py submit --wallet bt --hotkey live2 --image-uri asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner --image-digest sha256:THE_NEW_DIGEST_FROM_INSPECT --version 2
+python client/submit.py status --wallet bt --hotkey live2
+```
+
 
 ## Version history
 

@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import numpy as np
 
-from synth_ultra.constants import HORIZON_SECONDS, INV_NORM, NUM_PERCENTILES
+from synth_ultra.constants import HORIZON_SECONDS, INV_LAPLACE, NUM_PERCENTILES
 from synth_ultra.features import extract
 
 _EPS = 1e-12
 _MIN_PRICE = 1e-8
-_MIN_SIGMA = 3e-5
+_MIN_SIGMA = 4e-5
 _MAX_SIGMA = 2e-2
-_WIDTH_SCALE = 1.0
+_SIGMA_SCALE = 1.25
+_FLOW_MU = 3.2e-5
 
 
 def _sanitize(x: np.ndarray) -> np.ndarray:
@@ -30,28 +31,28 @@ def predict_percentiles(payload: dict) -> np.ndarray:
 
     Output constraints (SPECIFICATION.md): shape (100,), float64, finite,
     strictly positive, non-decreasing. Quantile grid q_i = (2i-1)/200.
+
+    Location is current spot microprice plus a small microstructure drift.
+    Scale is 10s vol from candles and the book-ticker micro path. Shape is
+    unit-variance Laplace — 10s BTC residuals are fat-tailed, so a Gaussian
+    under-covers the 1% tails and loses pinball CRPS on jumps.
     """
     f = extract(payload)
     px = max(f["price"], _MIN_PRICE)
 
-    vol_10s = f["vol_1s"] * np.sqrt(float(HORIZON_SECONDS))
+    candle_vol = f["vol_1s"]
+    micro_vol = f["micro_vol_1s"]
+    vol_1s = 0.6 * candle_vol + 0.4 * micro_vol if micro_vol > 0.0 else candle_vol
+    vol_10s = vol_1s * np.sqrt(float(HORIZON_SECONDS))
     sigma = 0.85 * vol_10s + 0.15 * max(f["spread_rel"], 0.0)
     if f["stale_ms"] > 250.0:
         sigma *= 1.0 + min(f["stale_ms"] / 1000.0, 1.0)
-    sigma = float(np.clip(sigma, _MIN_SIGMA, _MAX_SIGMA)) * _WIDTH_SCALE
+    sigma = float(np.clip(sigma * _SIGMA_SCALE, _MIN_SIGMA, _MAX_SIGMA))
 
-    mu = (
-        0.03 * f["top_obi"] * sigma
-        + 0.1 * f["obi"] * sigma
-        + 0.02 * f["flow_fast"] * sigma
-        + 0.02 * f["flow"] * sigma
-        + 0.1 * f["momentum"]
-        + 0.02 * np.clip(f["basis"], -0.001, 0.001)
-    )
-    mu = float(np.clip(mu, -4.0 * sigma, 4.0 * sigma))
+    mu = float(np.clip(_FLOW_MU * f["flow_fast"], -2.5 * sigma, 2.5 * sigma))
 
     log_px = np.log(px)
-    out = np.exp(log_px + mu + sigma * INV_NORM, dtype=np.float64)
+    out = np.exp(log_px + mu + sigma * INV_LAPLACE, dtype=np.float64)
     return _sanitize(out)
 
 

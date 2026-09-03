@@ -75,3 +75,16 @@ def _norm_ppf(p: np.ndarray) -> np.ndarray:
 
 
 INV_NORM = _norm_ppf(QUANTILE_GRID)
+
+
+def _laplace_ppf(p: np.ndarray) -> np.ndarray:
+    """Unit-variance Laplace quantile function.
+
+    10s BTC residuals are leptokurtic (rms/MAE ≈ 1.7 vs 1.25 Gaussian).
+    Laplace puts mass in the tails and keeps the shoulders tight.
+    """
+    u = np.asarray(p, dtype=np.float64) - 0.5
+    return -np.sign(u) / np.sqrt(2.0) * np.log(np.maximum(1.0 - 2.0 * np.abs(u), 1e-15))
+
+
+INV_LAPLACE = _laplace_ppf(QUANTILE_GRID)
