@@ -22,6 +22,9 @@ from synth_ultra.validate import (
     write_forecast_picture,
 )
 
+# Flip to False to skip writing plot/*.svg during a backtest.
+WRITE_SVG = True
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Validate Synth Ultra model contract")
@@ -63,6 +66,19 @@ def main(argv: list[str] | None = None) -> int:
 
     def on_test(i: int, one: dict[str, Any]) -> None:
         print(f"=== test {i} ===")
+        if one["crps"] is None:
+            print(
+                f"start={one['current_time_utc']}  "
+                f"target={one['target_utc']}  "
+                f"CRPS=dropped (spot book-ticker not live at horizon)"
+            )
+            print(
+                f"OK  output contract  "
+                f"predict={one['max_ms']:.3f} ms  "
+                f"elapsed={one['elapsed_s']:.3f} s"
+            )
+            sys.stdout.flush()
+            return
         print(
             f"start={one['current_time_utc']}  "
             f"target={one['target_utc']}  "
@@ -74,14 +90,15 @@ def main(argv: list[str] | None = None) -> int:
             f"elapsed={one['elapsed_s']:.3f} s"
         )
         sys.stdout.flush()
-        write_forecast_picture(
-            forecast_svg_path(int(one["target_ms"])),
-            one["percentiles"],
-            float(one["realized_close"]),
-            one["current_time_utc"],
-            one["target_utc"],
-            float(one["crps"]),
-        )
+        if WRITE_SVG:
+            write_forecast_picture(
+                forecast_svg_path(int(one["target_ms"])),
+                one["percentiles"],
+                float(one["realized_price"]),
+                one["current_time_utc"],
+                one["target_utc"],
+                float(one["crps"]),
+            )
 
     try:
         loaded = load_payload(args.payload) if args.payload is not None else None
@@ -101,7 +118,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
     print()
-    print(f"average CRPS={report['crps']:.6f}")
+    dropped = int(report.get("n_dropped") or 0)
+    scored = int(report.get("n_scored") or 0)
+    if report["crps"] is None:
+        print(f"average CRPS=dropped  scored=0  dropped={dropped}")
+        print(f"maximum predict time={report['max_ms']:.3f} ms")
+        print(
+            "FAIL: no prediction scored — spot book-ticker is not live at "
+            "current_time_ms + 10s (SPECIFICATION.md).",
+            file=sys.stderr,
+        )
+        return 1
+    extra = f"  scored={scored}  dropped={dropped}" if dropped else ""
+    print(f"average CRPS={report['crps']:.6f}{extra}")
     print(f"maximum predict time={report['max_ms']:.3f} ms")
     crps_path = crps_csv_path(str(report["asset"]))
     write_crps_csv(crps_path, report["reports"])

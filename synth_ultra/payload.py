@@ -298,6 +298,8 @@ def _candles_at(path: Path, current_time_ms: int, *, compact: bool) -> dict | No
     sl = _window_slice(times, current_time_ms - CANDLE_WINDOW_S * 1000, current_time_ms)
     open_time_ms = times[sl]
     ohlcv = table["ohlcv"][sl]
+    if open_time_ms.size == 0:
+        return None
     complete = int(open_time_ms.size) >= CANDLE_WINDOW_S
     if compact and open_time_ms.size > 8:
         open_time_ms = open_time_ms[-8:]
@@ -316,6 +318,8 @@ def _trades_at(path: Path, current_time_ms: int, *, compact: bool) -> dict | Non
     times = table["ts_ms"]
     sl = _window_slice(times, current_time_ms - TRADE_WINDOW_S * 1000, current_time_ms)
     ts = times[sl]
+    if ts.size == 0:
+        return None
     if compact and ts.size > 6:
         sl_last = slice(ts.size - 6, ts.size)
         ts = ts[sl_last]
@@ -766,6 +770,52 @@ def _depth_updates_at(path: Path, t0: int, current_time_ms: int, *, compact: boo
     return [_materialize_depth_update(rec, futures=futures) for rec in chosen]
 
 
+def _empty_depth_snapshot(t_ms: int, *, futures: bool) -> dict:
+    return {
+        "recv_ts_ms": np.int64(t_ms),
+        "update_id": 0,
+        "bids": np.zeros((0, 2), dtype=np.float64),
+        "asks": np.zeros((0, 2), dtype=np.float64),
+        "event_ts_ms": int(t_ms - 1) if futures else None,
+        "transaction_ts_ms": int(t_ms - 2) if futures else None,
+    }
+
+
+def _empty_book_ticker(*, futures: bool) -> dict:
+    recv = np.array([], dtype=np.int64)
+    out: dict[str, Any] = {
+        "recv_ts_ms": recv,
+        "bid_price": np.array([], dtype=np.float64),
+        "bid_qty": np.array([], dtype=np.float64),
+        "ask_price": np.array([], dtype=np.float64),
+        "ask_qty": np.array([], dtype=np.float64),
+    }
+    if futures:
+        out["event_ts_ms"] = recv.copy()
+        out["transaction_ts_ms"] = recv.copy()
+    return out
+
+
+def _empty_candles() -> dict:
+    return {
+        "open_time_ms": np.array([], dtype=np.int64),
+        "ohlcv": np.zeros((0, 5), dtype=np.float64),
+        "complete_history": False,
+    }
+
+
+def _empty_trades_full() -> dict:
+    empty_i = np.array([], dtype=np.int64)
+    return {
+        "ts_ms": empty_i,
+        "event_ts_ms": empty_i.copy(),
+        "recv_ts_ms": empty_i.copy(),
+        "price": np.array([], dtype=np.float64),
+        "qty": np.array([], dtype=np.float64),
+        "buyer_is_maker": np.array([], dtype=bool),
+    }
+
+
 def _depth_bundle_at(
     *,
     current_time_ms: int,
@@ -775,7 +825,14 @@ def _depth_bundle_at(
     futures: bool,
     compact: bool,
     n_upd: int,
+    synthetic: bool = False,
+    fill_missing: bool = True,
 ) -> tuple[dict, dict, list[dict]]:
+    if synthetic:
+        start = _depth_snapshot(t0, px, rng, futures=futures)
+        latest = _depth_snapshot(current_time_ms, px, rng, futures=futures)
+        updates = _depth_updates(n_upd, t0, px, rng, futures=futures, start_id=start["update_id"])
+        return start, latest, updates
     snap_path = FUTURES_DEPTH_CSV if futures else SPOT_DEPTH_CSV
     upd_path = FUTURES_DEPTH_UPDATES_JSONL if futures else SPOT_DEPTH_UPDATES_JSONL
     snaps = _load_depth_snapshot_csv(str(snap_path))
@@ -792,10 +849,18 @@ def _depth_bundle_at(
     real_start = start is not None
     real_latest = latest is not None
     if start is None:
-        start = _depth_snapshot(t0, px, rng, futures=futures)
+        start = (
+            _depth_snapshot(t0, px, rng, futures=futures)
+            if fill_missing
+            else _empty_depth_snapshot(t0, futures=futures)
+        )
     if latest is None:
-        latest = _depth_snapshot(current_time_ms, px, rng, futures=futures)
-    if not updates and not real_start and not real_latest:
+        latest = (
+            _depth_snapshot(current_time_ms, px, rng, futures=futures)
+            if fill_missing
+            else _empty_depth_snapshot(current_time_ms, futures=futures)
+        )
+    if fill_missing and not updates and not real_start and not real_latest:
         updates = _depth_updates(
             n_upd, t0, px, rng, futures=futures, start_id=start["update_id"]
         )
@@ -854,6 +919,8 @@ def _venue(
     futures: bool,
     complete_candles: bool,
     compact: bool = False,
+    synthetic: bool = False,
+    fill_missing: bool = True,
 ) -> dict:
     n_trades = 6 if compact else (400 if futures else 350)
     n_bt = 8 if compact else (800 if futures else 700)
@@ -862,22 +929,35 @@ def _venue(
     candles_path = FUTURES_CANDLES_CSV if futures else SPOT_CANDLES_CSV
     trades_path = FUTURES_TRADES_CSV if futures else SPOT_TRADES_CSV
     book_path = FUTURES_BOOK_TICKER_CSV if futures else SPOT_BOOK_TICKER_CSV
-    candles = _candles_at(candles_path, current_time_ms, compact=compact)
-    trades = _trades_at(trades_path, current_time_ms, compact=compact)
-    book_ticker = _book_ticker_at(book_path, current_time_ms, compact=compact, futures=futures)
+    if synthetic:
+        candles = None
+        trades = None
+        book_ticker = None
+    else:
+        candles = _candles_at(candles_path, current_time_ms, compact=compact)
+        trades = _trades_at(trades_path, current_time_ms, compact=compact)
+        book_ticker = _book_ticker_at(book_path, current_time_ms, compact=compact, futures=futures)
     if candles is None:
-        candles = _candles(
-            n_candles,
-            current_time_ms - n_candles * 1000,
-            px,
-            rng,
-            complete_candles,
-            compact=compact,
+        candles = (
+            _candles(
+                n_candles,
+                current_time_ms - n_candles * 1000,
+                px,
+                rng,
+                complete_candles,
+                compact=compact,
+            )
+            if fill_missing or synthetic
+            else _empty_candles()
         )
     if trades is None:
-        trades = _trades(n_trades, t0, px, rng)
+        trades = _trades(n_trades, t0, px, rng) if fill_missing or synthetic else _empty_trades_full()
     if book_ticker is None:
-        book_ticker = _book_ticker(n_bt, t0, px, rng, futures=futures)
+        book_ticker = (
+            _book_ticker(n_bt, t0, px, rng, futures=futures)
+            if fill_missing or synthetic
+            else _empty_book_ticker(futures=futures)
+        )
     if candles["ohlcv"].size:
         px = float(candles["ohlcv"][-1, 3])
     start, latest, updates = _depth_bundle_at(
@@ -888,11 +968,15 @@ def _venue(
         futures=futures,
         compact=compact,
         n_upd=n_upd,
+        synthetic=synthetic,
+        fill_missing=fill_missing or synthetic,
     )
-    last_trade = int(trades["ts_ms"][-1]) if trades["ts_ms"].size else current_time_ms
+    last_trade = (
+        int(trades["recv_ts_ms"][-1]) if trades["recv_ts_ms"].size else current_time_ms
+    )
     last_kline = int(candles["open_time_ms"][-1]) if candles["open_time_ms"].size else current_time_ms
     last_book = (
-        int(book_ticker["recv_ts_ms"][-1]) if book_ticker["recv_ts_ms"].size else current_time_ms - 2
+        int(book_ticker["recv_ts_ms"][-1]) if book_ticker["recv_ts_ms"].size else current_time_ms
     )
     last_event_times = {
         "trade": np.int64(last_trade),
@@ -918,6 +1002,8 @@ def make_sample_payload(
     price: float = 97_500.0,
     current_time_ms: int | None = None,
     compact: bool = False,
+    synthetic: bool = False,
+    fill_missing: bool = True,
 ) -> dict:
     """Build a schema_version-3 payload with NumPy arrays, oldest-first.
 
@@ -926,6 +1012,8 @@ def make_sample_payload(
     REST snapshots, futures bookDepth, or live diffs when those files exist.
     ``compact=True`` keeps the same keys and dtypes but short arrays, so the
     file is small enough to inspect before a full-size latency test.
+    ``synthetic=True`` ignores CSVs and builds a shape-faithful dummy (input.md).
+    ``fill_missing=False`` never invents streams — used by the local backtest.
     """
     rng = np.random.default_rng(seed)
     now = int(current_time_ms if current_time_ms is not None else default_current_time_ms())
@@ -949,6 +1037,8 @@ def make_sample_payload(
                 futures=False,
                 complete_candles=True,
                 compact=compact,
+                synthetic=synthetic,
+                fill_missing=fill_missing,
             ),
             "futures": _venue(
                 current_time_ms=now,
@@ -958,6 +1048,8 @@ def make_sample_payload(
                 futures=True,
                 complete_candles=False,
                 compact=compact,
+                synthetic=synthetic,
+                fill_missing=fill_missing,
             ),
         },
     }
@@ -1071,6 +1163,7 @@ def _venue_from_jsonable(venue: dict, *, futures: bool) -> dict:
 
 
 ENV_PAYLOAD_JSON = REPO_ROOT / "examples" / "env_payload.json"
+SAMPLE_PAYLOAD_JSON = REPO_ROOT / "examples" / "sample_payload.json"
 
 
 def payload_from_jsonable(obj: dict) -> dict:
@@ -1093,3 +1186,91 @@ def load_payload(path: Path | None = None) -> dict:
     """Load a saved environment payload JSON into the live dict-of-arrays shape."""
     target = Path(path) if path is not None else ENV_PAYLOAD_JSON
     return payload_from_jsonable(json.loads(target.read_text(encoding="utf-8")))
+
+
+def assert_payload_schema(payload: dict) -> None:
+    """Fail if the payload does not match input.md schema_version 3."""
+    if int(payload["schema_version"]) != SCHEMA_VERSION:
+        raise ValueError("schema_version")
+    prompt = payload["prompt"]
+    for key in (
+        "asset",
+        "horizon_seconds",
+        "num_percentiles",
+        "quantile_grid",
+        "current_time_ms",
+        "trigger",
+    ):
+        if key not in prompt:
+            raise ValueError(f"prompt.{key}")
+    trigger = prompt["trigger"] or {}
+    if trigger.get("kind") not in ("interval", "trade", "book"):
+        raise ValueError("prompt.trigger.kind")
+    if int(prompt["horizon_seconds"]) != HORIZON_SECONDS:
+        raise ValueError("prompt.horizon_seconds")
+    if int(prompt["num_percentiles"]) != NUM_PERCENTILES:
+        raise ValueError("prompt.num_percentiles")
+    if str(prompt["quantile_grid"]) != "centered-100":
+        raise ValueError("prompt.quantile_grid")
+    for name, futures in (("spot", False), ("futures", True)):
+        venue = payload["venues"][name]
+        if venue["symbol"] != "BTCUSDT":
+            raise ValueError(f"{name}.symbol")
+        candles = venue["candles_1s"]
+        ohlcv = np.asarray(candles["ohlcv"])
+        if ohlcv.ndim != 2 or ohlcv.shape[-1] != 5:
+            raise ValueError(f"{name}.candles_1s.ohlcv")
+        if "complete_history" not in candles:
+            raise ValueError(f"{name}.candles_1s.complete_history")
+        trades = venue["trades"]
+        for key in ("ts_ms", "event_ts_ms", "recv_ts_ms", "price", "qty", "buyer_is_maker"):
+            if key not in trades:
+                raise ValueError(f"{name}.trades.{key}")
+        bt = venue["book_ticker"]
+        for key in ("recv_ts_ms", "bid_price", "bid_qty", "ask_price", "ask_qty"):
+            if key not in bt:
+                raise ValueError(f"{name}.book_ticker.{key}")
+        if futures:
+            if "event_ts_ms" not in bt or "transaction_ts_ms" not in bt:
+                raise ValueError("futures.book_ticker exchange times")
+        elif "event_ts_ms" in bt or "transaction_ts_ms" in bt:
+            raise ValueError("spot.book_ticker must omit E/T")
+        for snap_name in ("depth_start", "depth_latest"):
+            snap = venue[snap_name]
+            bids = np.asarray(snap["bids"])
+            asks = np.asarray(snap["asks"])
+            if bids.ndim != 2 or bids.shape[1] != 2:
+                raise ValueError(f"{name}.{snap_name}.bids")
+            if asks.ndim != 2 or asks.shape[1] != 2:
+                raise ValueError(f"{name}.{snap_name}.asks")
+            if futures:
+                if snap["event_ts_ms"] is None or snap["transaction_ts_ms"] is None:
+                    raise ValueError(f"futures.{snap_name} exchange times")
+            elif snap["event_ts_ms"] is not None or snap["transaction_ts_ms"] is not None:
+                raise ValueError(f"spot.{snap_name} E/T must be None")
+        for upd in venue["depth_updates"]:
+            if "event_ts_ms" not in upd:
+                raise ValueError(f"{name}.depth_updates.event_ts_ms")
+            if futures:
+                if "transaction_ts_ms" not in upd:
+                    raise ValueError("futures.depth_updates.transaction_ts_ms")
+            elif "transaction_ts_ms" in upd:
+                raise ValueError("spot.depth_updates must omit T")
+        last = venue.get("last_event_times") or {}
+        for stream in ("trade", "depth", "bookTicker", "kline_1s"):
+            if stream not in last:
+                raise ValueError(f"{name}.last_event_times.{stream}")
+
+
+def write_sample_payload(path: Path | None = None, **kwargs: Any) -> Path:
+    """Write a shape-faithful compact sample matching input.md."""
+    kwargs.setdefault("seed", 0)
+    kwargs.setdefault("compact", True)
+    kwargs.setdefault("synthetic", True)
+    kwargs.setdefault("current_time_ms", 1_700_000_000_000)
+    payload = make_sample_payload(**kwargs)
+    assert_payload_schema(payload)
+    target = Path(path) if path is not None else SAMPLE_PAYLOAD_JSON
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload_to_jsonable(payload), indent=2), encoding="utf-8")
+    return target

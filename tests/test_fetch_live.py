@@ -133,15 +133,15 @@ def test_validate_payload_file_reports_crps(tmp_path: Path):
     save_payload(payload, path)
     loaded = payload_from_jsonable(json.loads(path.read_text(encoding="utf-8")))
 
-    def fake_close(current_time_ms, horizon_seconds=10, *, allow_rest=False):
+    def fake_micro(current_time_ms, horizon_seconds=10, *, allow_rest=False):
         return 100.0
 
-    orig = v.realized_spot_close
-    v.realized_spot_close = fake_close
+    orig = v.realized_spot_microprice
+    v.realized_spot_microprice = fake_micro
     try:
         report = v.validate(rounds=1, payload=loaded, allow_rest=False)
     finally:
-        v.realized_spot_close = orig
+        v.realized_spot_microprice = orig
     assert report["ok"] is True
     assert report["n"] == 1
     assert report["crps"] >= 0.0

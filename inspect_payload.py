@@ -13,8 +13,14 @@ from pathlib import Path
 import numpy as np
 
 from synth_ultra.model import predict_percentiles
-from synth_ultra.payload import ENV_PAYLOAD_JSON, load_payload, make_sample_payload, payload_to_jsonable
-from synth_ultra.scoring import pinball_crps, realized_spot_close
+from synth_ultra.payload import (
+    ENV_PAYLOAD_JSON,
+    assert_payload_schema,
+    load_payload,
+    make_sample_payload,
+    payload_to_jsonable,
+)
+from synth_ultra.scoring import pinball_crps, realized_spot_microprice
 from synth_ultra.validate import check_output
 
 
@@ -44,11 +50,14 @@ def summarize_venue(name: str, venue: dict) -> None:
     latest = venue["depth_latest"]
     bids = np.asarray(latest["bids"])
     asks = np.asarray(latest["asks"])
-    print(
-        f"    depth_latest   levels={bids.shape[0]}  "
-        f"best_bid={bids[0, 0]:.2f} x {bids[0, 1]:.3f}  "
-        f"best_ask={asks[0, 0]:.2f} x {asks[0, 1]:.3f}"
-    )
+    if bids.ndim == 2 and bids.shape[0] and asks.ndim == 2 and asks.shape[0]:
+        print(
+            f"    depth_latest   levels={bids.shape[0]}  "
+            f"best_bid={bids[0, 0]:.2f} x {bids[0, 1]:.3f}  "
+            f"best_ask={asks[0, 0]:.2f} x {asks[0, 1]:.3f}"
+        )
+    else:
+        print(f"    depth_latest   levels={0 if bids.ndim < 2 else bids.shape[0]}")
     print(f"    depth_updates  n={len(venue['depth_updates'])}")
 
 
@@ -85,8 +94,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.payload is not None:
         payload = load_payload(args.payload)
+    elif args.full:
+        payload = make_sample_payload(args.seed, compact=False)
     else:
-        payload = make_sample_payload(args.seed, compact=not args.full)
+        payload = make_sample_payload(
+            args.seed, compact=True, synthetic=True, current_time_ms=1_700_000_000_000
+        )
     prompt = payload["prompt"]
     print("input prompt")
     print(json.dumps(prompt, indent=2))
@@ -95,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     summarize_venue("futures", payload["venues"]["futures"])
 
     if not args.no_save and args.payload is None:
+        assert_payload_schema(payload)
         args.save.parent.mkdir(parents=True, exist_ok=True)
         args.save.write_text(
             json.dumps(payload_to_jsonable(payload), indent=2),
@@ -114,14 +128,15 @@ def main(argv: list[str] | None = None) -> int:
         from synth_ultra.constants import HORIZON_SECONDS
 
         anchor = int(prompt["current_time_ms"])
-        y = realized_spot_close(anchor, allow_rest=True)
+        y = realized_spot_microprice(anchor, allow_rest=True)
         if y is None:
             print(
-                f"\nCRPS skipped: no spot 1s close at current_time+{HORIZON_SECONDS}s. "
-                "Wait 10s after capture, or keep database/btc_spot_candles.csv covering that instant."
+                f"\nCRPS skipped: no live spot book-ticker at current_time+{HORIZON_SECONDS}s. "
+                "Wait ~10s after capture and retry, or keep database/btc_spot_book_ticker.csv "
+                "covering that instant."
             )
         else:
-            print(f"\nrealized_close={y:.4f}  CRPS={pinball_crps(out, y):.6f}")
+            print(f"\nrealized_microprice={y:.4f}  CRPS={pinball_crps(out, y):.6f}")
     return 0
 
 

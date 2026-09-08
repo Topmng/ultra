@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import numpy as np
 
-from synth_ultra.constants import HORIZON_SECONDS, INV_LAPLACE, NUM_PERCENTILES
+from synth_ultra.constants import HORIZON_SECONDS, LAPLACE_Z, NUM_PERCENTILES
 from synth_ultra.features import extract
 
 _EPS = 1e-12
 _MIN_PRICE = 1e-8
-_MIN_SIGMA = 4e-5
-_MAX_SIGMA = 2e-2
-_SIGMA_SCALE = 1.25
-_FLOW_MU = 3.2e-5
+_MIN_B = 8e-6
+_MAX_B = 2e-2
+_VOL_K = 0.82
+_JUMP_Z = 2.0
+_JUMP_MR = 0.18
 
 
 def _sanitize(x: np.ndarray) -> np.ndarray:
@@ -31,28 +32,34 @@ def predict_percentiles(payload: dict) -> np.ndarray:
 
     Output constraints (SPECIFICATION.md): shape (100,), float64, finite,
     strictly positive, non-decreasing. Quantile grid q_i = (2i-1)/200.
-
-    Location is current spot microprice plus a small microstructure drift.
-    Scale is 10s vol from candles and the book-ticker micro path. Shape is
-    unit-variance Laplace — 10s BTC residuals are fat-tailed, so a Gaussian
-    under-covers the 1% tails and loses pinball CRPS on jumps.
     """
     f = extract(payload)
     px = max(f["price"], _MIN_PRICE)
 
-    candle_vol = f["vol_1s"]
-    micro_vol = f["micro_vol_1s"]
-    vol_1s = 0.6 * candle_vol + 0.4 * micro_vol if micro_vol > 0.0 else candle_vol
-    vol_10s = vol_1s * np.sqrt(float(HORIZON_SECONDS))
-    sigma = 0.85 * vol_10s + 0.15 * max(f["spread_rel"], 0.0)
+    vol_10s = f["vol_1s"] * np.sqrt(float(HORIZON_SECONDS))
+    b = _VOL_K * vol_10s + 0.04 * max(f["spread_rel"], 0.0)
     if f["stale_ms"] > 250.0:
-        sigma *= 1.0 + min(f["stale_ms"] / 1000.0, 1.0)
-    sigma = float(np.clip(sigma * _SIGMA_SCALE, _MIN_SIGMA, _MAX_SIGMA))
+        b *= 1.0 + min(f["stale_ms"] / 2000.0, 0.5)
+    b = float(np.clip(b, _MIN_B, _MAX_B))
 
-    mu = float(np.clip(_FLOW_MU * f["flow_fast"], -2.5 * sigma, 2.5 * sigma))
+    mu = (
+        0.20 * f["top1_obi"] * b
+        + 0.08 * f["top_obi"] * b
+        + 0.10 * f["book_obi"] * b
+        + 0.10 * f["book_obi_avg"] * b
+        + 0.40 * f["flow1s"] * b
+        + 0.08 * f["flow20"] * b
+        + 0.08 * f["ret_1s"]
+        + 0.55 * f["lead_1s"]
+        + 0.12 * float(np.clip(f["basis"], -4e-4, 4e-4))
+    )
+    # Fade only still-extending jumps; skip if the last second already reversed.
+    if abs(f["ret_10s"]) > _JUMP_Z * b and f["ret_1s"] * f["ret_10s"] >= 0.0:
+        mu -= _JUMP_MR * f["ret_10s"]
+    mu = float(np.clip(mu, -3.0 * b, 3.0 * b))
 
     log_px = np.log(px)
-    out = np.exp(log_px + mu + sigma * INV_LAPLACE, dtype=np.float64)
+    out = np.exp(log_px + mu + b * LAPLACE_Z, dtype=np.float64)
     return _sanitize(out)
 
 

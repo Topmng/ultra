@@ -13,6 +13,10 @@ CANDLE_WINDOW_S = 3600
 TRADE_WINDOW_S = 60
 BOOK_TICKER_WINDOW_S = 60
 SCHEMA_VERSION = 3
+# Spec: drop the score if the spot book-ticker feed is not live around the target.
+SPOT_FEED_LIVE_MS = 1000
+# REST bookTicker is "now"; allow a few seconds so inspect-after-10s still works.
+SPOT_FEED_REST_LIVE_MS = 5000
 
 
 def _norm_ppf(p: np.ndarray) -> np.ndarray:
@@ -75,16 +79,5 @@ def _norm_ppf(p: np.ndarray) -> np.ndarray:
 
 
 INV_NORM = _norm_ppf(QUANTILE_GRID)
-
-
-def _laplace_ppf(p: np.ndarray) -> np.ndarray:
-    """Unit-variance Laplace quantile function.
-
-    10s BTC residuals are leptokurtic (rms/MAE ≈ 1.7 vs 1.25 Gaussian).
-    Laplace puts mass in the tails and keeps the shoulders tight.
-    """
-    u = np.asarray(p, dtype=np.float64) - 0.5
-    return -np.sign(u) / np.sqrt(2.0) * np.log(np.maximum(1.0 - 2.0 * np.abs(u), 1e-15))
-
-
-INV_LAPLACE = _laplace_ppf(QUANTILE_GRID)
+_U = QUANTILE_GRID - 0.5
+LAPLACE_Z = -np.sign(_U) * np.log(np.maximum(1.0 - 2.0 * np.abs(_U), 1e-12))

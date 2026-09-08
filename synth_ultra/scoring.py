@@ -2,71 +2,96 @@
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
-from synth_ultra.constants import HORIZON_SECONDS, NUM_PERCENTILES, QUANTILE_GRID
+from synth_ultra.constants import (
+    HORIZON_SECONDS,
+    NUM_PERCENTILES,
+    QUANTILE_GRID,
+    SPOT_FEED_LIVE_MS,
+    SPOT_FEED_REST_LIVE_MS,
+)
 
 
-def _spot_close_from_csv(target_ms: int) -> float | None:
-    from synth_ultra.payload import SPOT_CANDLES_CSV, _load_candles_csv
+def spot_microprice(bid_price: float, bid_qty: float, ask_price: float, ask_qty: float) -> float:
+    """Scoring target: last spot book-ticker microprice at the horizon instant."""
+    den = bid_qty + ask_qty
+    if den <= 0.0:
+        return 0.5 * (bid_price + ask_price)
+    return (bid_price * ask_qty + ask_price * bid_qty) / den
 
-    table = _load_candles_csv(str(SPOT_CANDLES_CSV))
-    if table is None or table["open_time_ms"].size == 0:
+
+def _finite_positive_book(bp: float, bq: float, ap: float, aq: float) -> bool:
+    vals = (bp, bq, ap, aq)
+    return bool(np.all(np.isfinite(vals))) and bp > 0.0 and ap > 0.0 and bq >= 0.0 and aq >= 0.0
+
+
+def _spot_microprice_from_csv(target_ms: int) -> float | None:
+    from synth_ultra.payload import SPOT_BOOK_TICKER_CSV, _load_book_ticker_csv
+
+    table = _load_book_ticker_csv(str(SPOT_BOOK_TICKER_CSV))
+    if table is None or table["recv_ts_ms"].size == 0:
         return None
-    times = table["open_time_ms"]
-    i = int(np.searchsorted(times, target_ms, side="left"))
-    if i >= times.size or int(times[i]) != target_ms:
+    times = table["recv_ts_ms"]
+    i = int(np.searchsorted(times, int(target_ms), side="right") - 1)
+    if i < 0:
         return None
-    return float(table["ohlcv"][i, 3])
+    recv = int(times[i])
+    if int(target_ms) - recv > SPOT_FEED_LIVE_MS:
+        return None
+    bp = float(table["bid_price"][i])
+    bq = float(table["bid_qty"][i])
+    ap = float(table["ask_price"][i])
+    aq = float(table["ask_qty"][i])
+    if not _finite_positive_book(bp, bq, ap, aq):
+        return None
+    return spot_microprice(bp, bq, ap, aq)
 
 
-def _spot_close_from_rest(target_ms: int) -> float | None:
-    """One Binance spot 1s kline close when the local CSV does not cover the target."""
+def _spot_microprice_from_rest(target_ms: int) -> float | None:
+    """Live spot bookTicker only — Binance REST has no historical book-ticker series."""
     import json
-    import urllib.parse
     import urllib.request
 
-    query = urllib.parse.urlencode(
-        {
-            "symbol": "BTCUSDT",
-            "interval": "1s",
-            "startTime": int(target_ms),
-            "endTime": int(target_ms) + 999,
-            "limit": 1,
-        }
-    )
-    url = f"https://api.binance.com/api/v3/klines?{query}"
+    now = int(time.time() * 1000)
+    if abs(now - int(target_ms)) > SPOT_FEED_REST_LIVE_MS:
+        return None
+    url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT"
     request = urllib.request.Request(url, headers={"User-Agent": "synth-ultra-validate/1.0"})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            rows = json.loads(response.read().decode("utf-8"))
-    except (OSError, TimeoutError, json.JSONDecodeError):
+            row = json.loads(response.read().decode("utf-8"))
+    except (OSError, TimeoutError, json.JSONDecodeError, TypeError, ValueError, KeyError):
         return None
-    if not rows:
+    try:
+        bp = float(row["bidPrice"])
+        bq = float(row["bidQty"])
+        ap = float(row["askPrice"])
+        aq = float(row["askQty"])
+    except (KeyError, TypeError, ValueError):
         return None
-    open_ms = int(rows[0][0])
-    if open_ms >= 10**15:
-        open_ms //= 1000
-    if open_ms != int(target_ms):
+    if not _finite_positive_book(bp, bq, ap, aq):
         return None
-    return float(rows[0][4])
+    return spot_microprice(bp, bq, ap, aq)
 
 
-def realized_spot_close(
+def realized_spot_microprice(
     current_time_ms: int,
     horizon_seconds: int = HORIZON_SECONDS,
     *,
     allow_rest: bool = False,
 ) -> float | None:
-    """Spot 1s close at current_time_ms + horizon.
+    """Spot book-ticker microprice at current_time_ms + horizon.
 
-    Prefers database/btc_spot_candles.csv. With allow_rest=True, falls back to a single
-    Binance REST kline (needed for env_payload.json snapshots).
+    SPECIFICATION.md: last spot book-ticker at or before the target instant.
+    Returns None (prediction dropped, no penalty) if that feed is not live.
     """
-    target = (int(current_time_ms) + int(horizon_seconds) * 1000) // 1000 * 1000
-    y = _spot_close_from_csv(target)
+    target = int(current_time_ms) + int(horizon_seconds) * 1000
+    y = _spot_microprice_from_csv(target)
     if y is None and allow_rest:
-        y = _spot_close_from_rest(target)
+        y = _spot_microprice_from_rest(target)
     return y
 
 
@@ -81,11 +106,3 @@ def pinball_crps(percentiles: np.ndarray, realized_price: float) -> float:
     tau = QUANTILE_GRID
     rho = u * (tau - (u < 0.0).astype(np.float64))
     return float((2.0 / NUM_PERCENTILES) * np.sum(rho))
-
-
-def spot_microprice(bid_price: float, bid_qty: float, ask_price: float, ask_qty: float) -> float:
-    """Scoring target: last spot book-ticker microprice at the horizon instant."""
-    den = bid_qty + ask_qty
-    if den <= 0.0:
-        return 0.5 * (bid_price + ask_price)
-    return (bid_price * ask_qty + ask_price * bid_qty) / den

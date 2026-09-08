@@ -37,7 +37,7 @@ from synth_ultra.constants import (
     SCHEMA_VERSION,
     TRADE_WINDOW_S,
 )
-from synth_ultra.payload import ENV_PAYLOAD_JSON, payload_to_jsonable
+from synth_ultra.payload import ENV_PAYLOAD_JSON, payload_to_jsonable, assert_payload_schema
 
 SYMBOL = "BTCUSDT"
 STREAM_SYMBOL = "btcusdt"
@@ -655,51 +655,7 @@ def assemble_payload(
 
 def assert_env_payload_schema(payload: dict) -> None:
     """Fail if the payload does not match input.md schema_version 3."""
-    if int(payload["schema_version"]) != SCHEMA_VERSION:
-        raise ValueError("schema_version")
-    prompt = payload["prompt"]
-    for key in ("asset", "horizon_seconds", "num_percentiles", "quantile_grid", "current_time_ms", "trigger"):
-        if key not in prompt:
-            raise ValueError(f"prompt.{key}")
-    for name, futures in (("spot", False), ("futures", True)):
-        venue = payload["venues"][name]
-        if venue["symbol"] != SYMBOL:
-            raise ValueError(f"{name}.symbol")
-        candles = venue["candles_1s"]
-        if candles["ohlcv"].shape[-1] != 5:
-            raise ValueError(f"{name}.candles_1s.ohlcv")
-        trades = venue["trades"]
-        for key in ("ts_ms", "event_ts_ms", "recv_ts_ms", "price", "qty", "buyer_is_maker"):
-            if key not in trades:
-                raise ValueError(f"{name}.trades.{key}")
-        bt = venue["book_ticker"]
-        for key in ("recv_ts_ms", "bid_price", "bid_qty", "ask_price", "ask_qty"):
-            if key not in bt:
-                raise ValueError(f"{name}.book_ticker.{key}")
-        if futures:
-            if "event_ts_ms" not in bt or "transaction_ts_ms" not in bt:
-                raise ValueError("futures.book_ticker exchange times")
-        elif "event_ts_ms" in bt or "transaction_ts_ms" in bt:
-            raise ValueError("spot.book_ticker must omit E/T")
-        for snap_name in ("depth_start", "depth_latest"):
-            snap = venue[snap_name]
-            if snap["bids"].ndim != 2 or snap["bids"].shape[1] != 2:
-                raise ValueError(f"{name}.{snap_name}.bids")
-            if futures:
-                if snap["event_ts_ms"] is None or snap["transaction_ts_ms"] is None:
-                    raise ValueError(f"futures.{snap_name} exchange times")
-            elif snap["event_ts_ms"] is not None or snap["transaction_ts_ms"] is not None:
-                raise ValueError(f"spot.{snap_name} E/T must be None")
-        for upd in venue["depth_updates"]:
-            if "event_ts_ms" not in upd:
-                raise ValueError(f"{name}.depth_updates.event_ts_ms")
-            if futures:
-                if "transaction_ts_ms" not in upd:
-                    raise ValueError("futures.depth_updates.transaction_ts_ms")
-            elif "transaction_ts_ms" in upd:
-                raise ValueError("spot.depth_updates must omit T")
-        if not venue["last_event_times"]:
-            raise ValueError(f"{name}.last_event_times")
+    assert_payload_schema(payload)
 
 
 def save_payload(payload: dict, path: Path, *, pretty: bool = False) -> None:

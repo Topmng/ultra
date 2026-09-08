@@ -97,6 +97,40 @@ def trade_imbalance(trades: dict | None, last_n: int | None = None) -> float:
     return float(np.sum(signed) / tot)
 
 
+def _trade_times(trades: dict) -> np.ndarray:
+    recv = trades.get("recv_ts_ms")
+    if recv is not None:
+        arr = np.asarray(recv)
+        if arr.size:
+            return arr.astype(np.int64, copy=False)
+    ts = trades.get("ts_ms")
+    if ts is None:
+        return np.empty(0, dtype=np.int64)
+    return np.asarray(ts, dtype=np.int64)
+
+
+def trade_imbalance_window(trades: dict | None, now_ms: int, dt_ms: int) -> float:
+    """Signed aggressor flow over the trailing dt_ms (recv clock)."""
+    if not trades or dt_ms <= 0:
+        return 0.0
+    ts = _trade_times(trades)
+    qty = _as_f64(trades.get("qty"))
+    maker = _as_bool(trades.get("buyer_is_maker"))
+    n = min(ts.size, qty.size, maker.size)
+    if n == 0:
+        return 0.0
+    i0 = int(np.searchsorted(ts[:n], int(now_ms) - int(dt_ms), side="left"))
+    if i0 >= n:
+        return 0.0
+    qty = qty[i0:n]
+    maker = maker[i0:n]
+    tot = float(np.sum(qty))
+    if tot <= 0.0:
+        return 0.0
+    signed = np.where(maker, -qty, qty)
+    return float(np.sum(signed) / tot)
+
+
 def log_returns(close: np.ndarray) -> np.ndarray:
     close = np.asarray(close, dtype=np.float64)
     close = close[np.isfinite(close) & (close > 0.0)]
@@ -115,6 +149,36 @@ def ewma_vol(returns: np.ndarray, lam: float = 0.94) -> float:
     return float(np.sqrt(np.dot(w, r2)))
 
 
+def rms_vol(returns: np.ndarray) -> float:
+    if returns.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(returns * returns)))
+
+
+def har_vol(returns: np.ndarray) -> float:
+    """Short EWMA mixed with longer RMS so post-jump width does not collapse."""
+    if returns.size == 0:
+        return 0.0
+    v30 = ewma_vol(returns[-30:])
+    v120 = rms_vol(returns[-120:])
+    v300 = rms_vol(returns[-300:])
+    parts = []
+    weights = []
+    if v30 > 0.0:
+        parts.append(v30)
+        weights.append(0.50)
+    if v120 > 0.0:
+        parts.append(v120)
+        weights.append(0.30)
+    if v300 > 0.0:
+        parts.append(v300)
+        weights.append(0.20)
+    if not parts:
+        return 0.0
+    w = np.asarray(weights, dtype=np.float64)
+    return float(np.dot(w / w.sum(), np.asarray(parts, dtype=np.float64)))
+
+
 def candle_close(venue: dict | None) -> np.ndarray:
     if not venue:
         return np.empty(0, dtype=np.float64)
@@ -125,50 +189,54 @@ def candle_close(venue: dict | None) -> np.ndarray:
     return ohlcv[:, 3]
 
 
+def last_book_obi(book_ticker: dict | None) -> float:
+    """Signed qty imbalance at the last book-ticker quote."""
+    if not book_ticker:
+        return 0.0
+    bid_q = _as_f64(book_ticker.get("bid_qty"))
+    ask_q = _as_f64(book_ticker.get("ask_qty"))
+    bq, aq = float(bid_q[-1]), float(ask_q[-1])
+    tot = bq + aq
+    if tot <= 0.0 or not np.isfinite(tot):
+        return 0.0
+    return (bq - aq) / tot
+
+
+def book_obi_mean(book_ticker: dict | None, last_n: int = 8) -> float:
+    """Mean BBO qty imbalance over the last few book-ticker rows."""
+    if not book_ticker or last_n <= 0:
+        return 0.0
+    bid_q = _as_f64(book_ticker.get("bid_qty"))
+    ask_q = _as_f64(book_ticker.get("ask_qty"))
+    n = min(int(last_n), bid_q.size, ask_q.size)
+    if n == 0:
+        return 0.0
+    bq = bid_q[-n:]
+    aq = ask_q[-n:]
+    tot = bq + aq
+    mask = tot > 0.0
+    if not np.any(mask):
+        return 0.0
+    return float(np.mean((bq[mask] - aq[mask]) / tot[mask]))
+
+
+def log_ret_n(close: np.ndarray, n: int) -> float:
+    if close.size <= n:
+        return 0.0
+    c0 = float(close[-(n + 1)])
+    c1 = float(close[-1])
+    if c0 <= 0.0 or c1 <= 0.0:
+        return 0.0
+    return float(np.log(c1 / c0))
+
+
 def venue_vol_and_momentum(venue: dict | None) -> tuple[float, float]:
-    """1s EWMA vol and last-horizon log return. Falls back to zeros."""
+    """HAR 1s vol and last-horizon log return. Falls back to zeros."""
     close = candle_close(venue)
     rets = log_returns(close)
-    vol_1s = ewma_vol(rets[-120:] if rets.size else rets)
-    if close.size > HORIZON_SECONDS:
-        c0 = close[-(HORIZON_SECONDS + 1)]
-        c1 = close[-1]
-        mom = float(np.log(c1 / c0)) if c0 > 0.0 and c1 > 0.0 else 0.0
-    else:
-        mom = 0.0
+    vol_1s = har_vol(rets)
+    mom = log_ret_n(close, HORIZON_SECONDS)
     return vol_1s, mom
-
-
-def _micro_series(book_ticker: dict | None) -> tuple[np.ndarray, np.ndarray]:
-    if not book_ticker:
-        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
-    ts = np.asarray(book_ticker.get("recv_ts_ms", []), dtype=np.int64)
-    bid_p = _as_f64(book_ticker.get("bid_price"))
-    bid_q = _as_f64(book_ticker.get("bid_qty"))
-    ask_p = _as_f64(book_ticker.get("ask_price"))
-    ask_q = _as_f64(book_ticker.get("ask_qty"))
-    n = min(ts.size, bid_p.size, bid_q.size, ask_p.size, ask_q.size)
-    if n == 0:
-        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
-    bid_p, bid_q, ask_p, ask_q = bid_p[-n:], bid_q[-n:], ask_p[-n:], ask_q[-n:]
-    den = bid_q + ask_q
-    mid = 0.5 * (bid_p + ask_p)
-    micro = np.where(den > 0.0, (bid_p * ask_q + ask_p * bid_q) / np.where(den > 0.0, den, 1.0), mid)
-    return ts[-n:], micro.astype(np.float64, copy=False)
-
-
-def book_micro_vol(book_ticker: dict | None) -> float:
-    """EWMA vol of 1s-downsampled book-ticker microprice returns."""
-    ts, micro = _micro_series(book_ticker)
-    if ts.size < 2 or micro[-1] <= 0.0:
-        return 0.0
-    sec = ts // 1000
-    keep = np.empty(sec.size, dtype=bool)
-    keep[-1] = True
-    if sec.size > 1:
-        keep[:-1] = sec[1:] != sec[:-1]
-    rets = log_returns(micro[keep])
-    return ewma_vol(rets[-120:] if rets.size else rets)
 
 
 def last_event_age_ms(venue: dict | None, now_ms: int) -> float:
@@ -205,10 +273,11 @@ def extract(payload: dict) -> dict[str, float]:
 
     vol_1s = 0.6 * spot_vol + 0.4 * fut_vol if fut_vol > 0.0 else spot_vol
     mom = 0.5 * spot_mom + 0.5 * fut_mom
-
-    spot_mvol = book_micro_vol(spot.get("book_ticker"))
-    fut_mvol = book_micro_vol(fut.get("book_ticker"))
-    micro_vol_1s = 0.6 * spot_mvol + 0.4 * fut_mvol if fut_mvol > 0.0 else spot_mvol
+    spot_close = candle_close(spot)
+    ret_1s = log_ret_n(spot_close, 1)
+    ret_10s = log_ret_n(spot_close, HORIZON_SECONDS)
+    fut_ret_1s = log_ret_n(candle_close(fut), 1) if fut_complete else ret_1s
+    lead_1s = fut_ret_1s - ret_1s
 
     obi = 0.5 * depth_imbalance(spot.get("depth_latest")) + 0.5 * depth_imbalance(
         fut.get("depth_latest")
@@ -216,9 +285,24 @@ def extract(payload: dict) -> dict[str, float]:
     top_obi = 0.5 * top_imbalance(spot.get("depth_latest")) + 0.5 * top_imbalance(
         fut.get("depth_latest")
     )
+    top1_obi = 0.5 * top_imbalance(spot.get("depth_latest"), n=1) + 0.5 * top_imbalance(
+        fut.get("depth_latest"), n=1
+    )
+    book_obi = 0.6 * last_book_obi(spot.get("book_ticker")) + 0.4 * last_book_obi(
+        fut.get("book_ticker")
+    )
+    book_obi_avg = 0.6 * book_obi_mean(spot.get("book_ticker")) + 0.4 * book_obi_mean(
+        fut.get("book_ticker")
+    )
     flow = 0.5 * trade_imbalance(spot.get("trades")) + 0.5 * trade_imbalance(fut.get("trades"))
     flow_fast = 0.5 * trade_imbalance(spot.get("trades"), last_n=50) + 0.5 * trade_imbalance(
         fut.get("trades"), last_n=50
+    )
+    flow20 = 0.5 * trade_imbalance(spot.get("trades"), last_n=20) + 0.5 * trade_imbalance(
+        fut.get("trades"), last_n=20
+    )
+    flow1s = 0.5 * trade_imbalance_window(spot.get("trades"), now_ms, 1000) + 0.5 * trade_imbalance_window(
+        fut.get("trades"), now_ms, 1000
     )
 
     px = spot_micro if spot_micro > 0.0 else (spot_mid if spot_mid > 0.0 else fut_micro)
@@ -237,7 +321,6 @@ def extract(payload: dict) -> dict[str, float]:
         "price": float(px),
         "mid": float(spot_mid if spot_mid > 0.0 else px),
         "vol_1s": float(vol_1s),
-        "micro_vol_1s": float(micro_vol_1s),
         "momentum": float(mom),
         "obi": float(obi),
         "top_obi": float(top_obi),
@@ -248,4 +331,12 @@ def extract(payload: dict) -> dict[str, float]:
         "stale_ms": float(stale_ms),
         "spot_complete": float(spot_complete),
         "fut_complete": float(fut_complete),
+        "ret_1s": float(ret_1s),
+        "ret_10s": float(ret_10s),
+        "lead_1s": float(lead_1s),
+        "top1_obi": float(top1_obi),
+        "book_obi": float(book_obi),
+        "book_obi_avg": float(book_obi_avg),
+        "flow20": float(flow20),
+        "flow1s": float(flow1s),
     }

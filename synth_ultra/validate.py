@@ -27,7 +27,7 @@ from synth_ultra.constants import (
 )
 from synth_ultra.model import predict_percentiles
 from synth_ultra.payload import make_sample_payload, preload_venue_csvs
-from synth_ultra.scoring import pinball_crps, realized_spot_close
+from synth_ultra.scoring import pinball_crps, realized_spot_microprice
 
 PLOT_DIR = Path("plot")
 CRPS_DIR = Path("crps")
@@ -62,8 +62,14 @@ def write_crps_csv(path: Path, reports: list[dict[str, Any]]) -> None:
         writer = csv.writer(handle)
         writer.writerow(("test", "start", "target", "crps"))
         for i, one in enumerate(reports, start=1):
+            crps = one.get("crps")
             writer.writerow(
-                (i, one["current_time_utc"], one["target_utc"], f"{one['crps']:.6f}")
+                (
+                    i,
+                    one["current_time_utc"],
+                    one["target_utc"],
+                    "" if crps is None else f"{crps:.6f}",
+                )
             )
 
 
@@ -140,7 +146,7 @@ def write_forecast_picture(
     title = "Output contract  (100,) float64  finite  positive  non-decreasing"
     subtitle = f"{escape(current_utc)}  →  {escape(target_utc)}"
     caption = (
-        f"CRPS={crps:.6f}   realized_close={realized:.4f}   "
+        f"CRPS={crps:.6f}   realized_microprice={realized:.4f}   "
         f"q=0.005 {prices[0]:.2f}   q=0.995 {prices[-1]:.2f}"
     )
 
@@ -188,7 +194,7 @@ def write_forecast_picture(
   {"".join(xlabels)}
   <text x="{left + plot_w / 2:.2f}" y="{h - 18}" text-anchor="middle" font-family="Segoe UI, Helvetica, sans-serif" font-size="12" fill="#333">BTC price</text>
   <text x="16" y="{top + plot_h / 2:.2f}" transform="rotate(-90 16 {top + plot_h / 2:.2f})" text-anchor="middle" font-family="Segoe UI, Helvetica, sans-serif" font-size="12" fill="#333">quantile q_i = (2i-1)/200</text>
-  <text x="{min(x_real + 8, left + plot_w - 160):.2f}" y="{top + 16}" font-family="Segoe UI, Helvetica, sans-serif" font-size="12" fill="#c0392b">realized close {realized:.2f}</text>
+  <text x="{min(x_real + 8, left + plot_w - 160):.2f}" y="{top + 16}" font-family="Segoe UI, Helvetica, sans-serif" font-size="12" fill="#c0392b">realized microprice {realized:.2f}</text>
   <text x="{label_x:.2f}" y="{label_y:.2f}" font-family="Segoe UI, Helvetica, sans-serif" font-size="12" fill="#1f4e79">100 predicted percentiles</text>
   <text x="{left}" y="{h - 8}" font-family="Segoe UI, Helvetica, sans-serif" font-size="12" fill="#333">{escape(caption)}</text>
 </svg>
@@ -206,18 +212,13 @@ def _validate_one(
     times: list[float] = []
     first = None
     crps: float | None = None
-    realized: float | None = None
     anchor = int(payload["prompt"]["current_time_ms"])
     target = anchor + HORIZON_SECONDS * 1000
+    realized = realized_spot_microprice(anchor, allow_rest=allow_rest)
     for _ in range(rounds):
         out, elapsed = run_once(payload)
-        realized = realized_spot_close(anchor, allow_rest=allow_rest)
-        if realized is None:
-            raise ValidationError(
-                f"no spot candle close at current_time+{HORIZON_SECONDS}s "
-                f"({ms_to_utc(target)}); need database/btc_spot_candles.csv or a live REST kline"
-            )
-        crps = pinball_crps(out, realized)
+        if realized is not None:
+            crps = pinball_crps(out, realized)
         if first is None:
             first = out
         elif not np.array_equal(first, out):
@@ -240,8 +241,9 @@ def _validate_one(
         "target_ms": target,
         "current_time_utc": ms_to_utc(anchor),
         "target_utc": ms_to_utc(target),
-        "realized_close": realized,
+        "realized_price": realized,
         "crps": crps,
+        "scored": realized is not None,
         "predict_times_s": times,
     }
 
@@ -289,7 +291,7 @@ def validate(
         asset = "BTC"
         for i, anchor in enumerate(anchors, start=1):
             t1 = time.perf_counter()
-            point_payload = make_sample_payload(seed, current_time_ms=anchor)
+            point_payload = make_sample_payload(seed, current_time_ms=anchor, fill_missing=False)
             if i == 1:
                 asset = str(point_payload["prompt"]["asset"])
             one = _validate_one(point_payload, rounds=rounds, allow_rest=allow_rest)
@@ -301,12 +303,16 @@ def validate(
 
     median = statistics.median(all_times)
     p95 = statistics.quantiles(all_times, n=20)[18] if len(all_times) >= 20 else max(all_times)
-    crps_vals = [float(r["crps"]) for r in reports]
+    scored = [r for r in reports if r["crps"] is not None]
+    crps_vals = [float(r["crps"]) for r in scored]
     first = reports[0]
     last = reports[-1]
+    display = scored[0] if scored else first
     report: dict[str, Any] = {
         "ok": True,
         "n": len(reports),
+        "n_scored": len(scored),
+        "n_dropped": len(reports) - len(scored),
         "time_interval": time_interval,
         "time_length": time_length,
         "median_ms": median * 1000.0,
@@ -327,11 +333,11 @@ def validate(
         "last_target_utc": last["target_utc"],
         "end_ms": start_ms + time_length * time_interval * 1000,
         "end_utc": ms_to_utc(start_ms + time_length * time_interval * 1000),
-        "realized_close": first["realized_close"],
-        "crps": float(statistics.mean(crps_vals)),
-        "crps_median": float(statistics.median(crps_vals)),
-        "crps_min": min(crps_vals),
-        "crps_max": max(crps_vals),
+        "realized_price": display["realized_price"],
+        "crps": float(statistics.mean(crps_vals)) if crps_vals else None,
+        "crps_median": float(statistics.median(crps_vals)) if crps_vals else None,
+        "crps_min": min(crps_vals) if crps_vals else None,
+        "crps_max": max(crps_vals) if crps_vals else None,
         "prepare_s": prepare_s,
         "asset": asset,
         "reports": reports,

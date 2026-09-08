@@ -8,13 +8,16 @@ from synth_ultra.model import predict_percentiles
 from synth_ultra.payload import (
     FUTURES_CANDLES_CSV,
     FUTURES_TRADES_CSV,
+    SAMPLE_PAYLOAD_JSON,
     SPOT_CANDLES_CSV,
     SPOT_TRADES_CSV,
+    assert_payload_schema,
     default_current_time_ms,
+    load_payload,
     make_sample_payload,
     payload_to_jsonable,
 )
-from synth_ultra.scoring import pinball_crps, spot_microprice
+from synth_ultra.scoring import pinball_crps, realized_spot_microprice, spot_microprice
 from synth_ultra.validate import backtest_anchors, check_output, run_once, validate
 
 
@@ -149,14 +152,68 @@ def test_validate_report_keys():
     assert "median_ms" in report
     assert report["budget_ms"] == 5.0
     assert report["crps"] is not None
-    assert report["realized_close"] > 0
+    assert report["realized_price"] > 0
+    assert report["n_scored"] >= 1
 
 
 def test_compact_json_payload_is_predictable():
-    payload = make_sample_payload(0, compact=True)
+    payload = make_sample_payload(0, compact=True, synthetic=True, current_time_ms=1_700_000_000_000)
     as_json = payload_to_jsonable(payload)
     assert as_json["venues"]["spot"]["book_ticker"]["bid_price"]
     assert "event_ts_ms" not in as_json["venues"]["spot"]["book_ticker"]
     out = predict_percentiles(as_json)
     check_output(out)
     assert len(as_json["venues"]["spot"]["candles_1s"]["ohlcv"]) == 8
+
+
+def test_synthetic_sample_matches_input_md():
+    payload = make_sample_payload(0, compact=True, synthetic=True, current_time_ms=1_700_000_000_000)
+    assert_payload_schema(payload)
+    spot = payload["venues"]["spot"]
+    fut = payload["venues"]["futures"]
+    assert spot["candles_1s"]["complete_history"] is True
+    assert fut["candles_1s"]["complete_history"] is False
+    assert spot["depth_latest"]["bids"].shape == (20, 2)
+    assert fut["depth_latest"]["asks"].shape == (20, 2)
+    assert "transaction_ts_ms" not in spot["depth_updates"][0]
+    assert "transaction_ts_ms" in fut["depth_updates"][0]
+    assert int(spot["last_event_times"]["trade"]) == int(spot["trades"]["recv_ts_ms"][-1])
+    assert int(fut["last_event_times"]["bookTicker"]) == int(fut["book_ticker"]["recv_ts_ms"][-1])
+
+
+def test_sample_payload_json_roundtrip():
+    if not SAMPLE_PAYLOAD_JSON.is_file():
+        pytest.skip("examples/sample_payload.json is not present")
+    payload = load_payload(SAMPLE_PAYLOAD_JSON)
+    assert_payload_schema(payload)
+    check_output(predict_percentiles(payload))
+
+
+def test_realized_microprice_from_book_ticker():
+    from synth_ultra.payload import SPOT_BOOK_TICKER_CSV, _load_book_ticker_csv
+
+    if not SPOT_BOOK_TICKER_CSV.is_file():
+        pytest.skip("spot book-ticker CSV is not present")
+    table = _load_book_ticker_csv(str(SPOT_BOOK_TICKER_CSV))
+    assert table is not None and table["recv_ts_ms"].size > 10
+    i = table["recv_ts_ms"].size // 2
+    recv = int(table["recv_ts_ms"][i])
+    expected = spot_microprice(
+        float(table["bid_price"][i]),
+        float(table["bid_qty"][i]),
+        float(table["ask_price"][i]),
+        float(table["ask_qty"][i]),
+    )
+    got = realized_spot_microprice(recv - 10_000)
+    assert got == pytest.approx(expected)
+
+
+def test_stale_spot_feed_is_dropped():
+    from synth_ultra.payload import SPOT_BOOK_TICKER_CSV, _load_book_ticker_csv
+
+    if not SPOT_BOOK_TICKER_CSV.is_file():
+        pytest.skip("spot book-ticker CSV is not present")
+    table = _load_book_ticker_csv(str(SPOT_BOOK_TICKER_CSV))
+    assert table is not None and table["recv_ts_ms"].size
+    last = int(table["recv_ts_ms"][-1])
+    assert realized_spot_microprice(last + 60_000) is None
