@@ -6,8 +6,11 @@ from pathlib import Path
 import numpy as np
 
 from fetch_live import (
+    RAW_STREAMS,
     LiveCapture,
     VenueBuf,
+    _NeedMore,
+    _ws_next_text,
     assemble_payload,
     assert_env_payload_schema,
     save_payload,
@@ -107,6 +110,7 @@ def test_assembled_payload_matches_env_schema():
         current_time_ms=now,
     )
     assert_env_payload_schema(payload)
+    assert payload["prompt"]["trigger"] == {"kind": "time", "venue": None}
     spot = payload["venues"]["spot"]
     fut = payload["venues"]["futures"]
     assert "event_ts_ms" not in spot["book_ticker"]
@@ -133,13 +137,13 @@ def test_validate_payload_file_reports_crps(tmp_path: Path):
     save_payload(payload, path)
     loaded = payload_from_jsonable(json.loads(path.read_text(encoding="utf-8")))
 
-    def fake_micro(current_time_ms, horizon_seconds=10, *, allow_rest=False):
+    def fake_micro(current_time_ms, horizon_seconds=10):
         return 100.0
 
     orig = v.realized_spot_microprice
     v.realized_spot_microprice = fake_micro
     try:
-        report = v.validate(rounds=1, payload=loaded, allow_rest=False)
+        report = v.validate(rounds=1, payload=loaded)
     finally:
         v.realized_spot_microprice = orig
     assert report["ok"] is True
@@ -163,3 +167,43 @@ def test_payload_json_roundtrip(tmp_path: Path):
     assert as_json["prompt"]["current_time_ms"] == now
     assert "event_ts_ms" not in as_json["venues"]["spot"]["book_ticker"]
     assert restored["venues"]["spot"]["trades"]["buyer_is_maker"].dtype == bool
+
+
+def _text_frame(text: str) -> bytes:
+    raw = text.encode("utf-8")
+    assert len(raw) < 126
+    return bytes([0x81, len(raw)]) + raw
+
+
+def test_split_websocket_frame_is_not_dropped():
+    raw = _text_frame('{"e":"bookTicker","b":"1"}')
+    sock = type("Sock", (), {"_ws_buf": raw[:6], "_ws_frag": None})()
+    try:
+        _ws_next_text(sock)
+    except _NeedMore:
+        pass
+    else:
+        raise AssertionError("partial frame should wait")
+    assert sock._ws_buf == raw[:6]
+    sock._ws_buf += raw[6:]
+    assert _ws_next_text(sock) == '{"e":"bookTicker","b":"1"}'
+    try:
+        _ws_next_text(sock)
+    except _NeedMore:
+        pass
+    else:
+        raise AssertionError("empty buffer should wait")
+
+
+def test_futures_aggtrade_uses_the_market_path():
+    paths = {(venue, stream): path for venue, _host, _port, path, stream in RAW_STREAMS}
+    assert paths[("futures", "btcusdt@aggTrade")] == "/market/ws/btcusdt@aggTrade"
+    assert paths[("futures", "btcusdt@bookTicker")] == "/public/ws/btcusdt@bookTicker"
+    assert paths[("futures", "btcusdt@depth@100ms")] == "/public/ws/btcusdt@depth@100ms"
+    assert paths[("spot", "btcusdt@aggTrade")] == "/ws/btcusdt@aggTrade"
+
+
+def test_two_websocket_frames_in_one_buffer():
+    sock = type("Sock", (), {"_ws_buf": _text_frame("one") + _text_frame("two"), "_ws_frag": None})()
+    assert _ws_next_text(sock) == "one"
+    assert _ws_next_text(sock) == "two"

@@ -26,8 +26,9 @@ from synth_ultra.constants import (
     QUANTILE_GRID,
 )
 from synth_ultra.model import predict_percentiles
-from synth_ultra.payload import make_sample_payload, preload_venue_csvs
-from synth_ultra.scoring import pinball_crps, realized_spot_microprice
+from synth_ultra.payload import load_payload, make_sample_payload, preload_venue_csvs
+from synth_ultra.saved_pairs import iter_pairs, load_book
+from synth_ultra.scoring import pinball_crps, realized_from_saved_book, realized_spot_microprice
 
 PLOT_DIR = Path("plot")
 CRPS_DIR = Path("crps")
@@ -60,15 +61,32 @@ def write_crps_csv(path: Path, reports: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(("test", "start", "target", "crps"))
+        writer.writerow(
+            (
+                "test",
+                "current_time_ms",
+                "start",
+                "target",
+                "book_recv_ts_ms",
+                "realized",
+                "crps",
+                "predict_ms",
+            )
+        )
         for i, one in enumerate(reports, start=1):
             crps = one.get("crps")
+            realized = one.get("realized_price")
+            book_recv = one.get("book_recv_ts_ms")
             writer.writerow(
                 (
                     i,
+                    one.get("current_time_ms", ""),
                     one["current_time_utc"],
                     one["target_utc"],
-                    "" if crps is None else f"{crps:.6f}",
+                    "" if book_recv is None else book_recv,
+                    "" if realized is None else f"{float(realized):.6f}",
+                    "" if crps is None else f"{float(crps):.6f}",
+                    f"{float(one['max_ms']):.3f}",
                 )
             )
 
@@ -203,18 +221,30 @@ def write_forecast_picture(
     path.write_text(svg, encoding="utf-8")
 
 
+_LOOKUP_REALIZED = object()
+
+
 def _validate_one(
     payload: dict,
     *,
     rounds: int,
-    allow_rest: bool = False,
+    warmup: int = 0,
+    realized_price: Any = _LOOKUP_REALIZED,
 ) -> dict[str, Any]:
     times: list[float] = []
     first = None
     crps: float | None = None
     anchor = int(payload["prompt"]["current_time_ms"])
-    target = anchor + HORIZON_SECONDS * 1000
-    realized = realized_spot_microprice(anchor, allow_rest=allow_rest)
+    horizon = int(payload["prompt"].get("horizon_seconds", HORIZON_SECONDS))
+    target = anchor + horizon * 1000
+    # SPECIFICATION.md: drop (no penalty) when the spot book is not live at the
+    # target. FAQ.md: the container's one warm-up call is not scored or timed.
+    if realized_price is _LOOKUP_REALIZED:
+        realized = realized_spot_microprice(anchor, horizon)
+    else:
+        realized = realized_price
+    for _ in range(max(0, warmup)):
+        predict_percentiles(payload)
     for _ in range(rounds):
         out, elapsed = run_once(payload)
         if realized is not None:
@@ -258,7 +288,6 @@ def validate(
     time_interval: int = 1,
     time_length: int = 1,
     payload: dict | None = None,
-    allow_rest: bool = False,
     on_test: Callable[[int, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     t_prep = time.perf_counter()
@@ -270,7 +299,7 @@ def validate(
         sys.stdout.flush()
     if payload is not None:
         t1 = time.perf_counter()
-        one = _validate_one(payload, rounds=rounds, allow_rest=allow_rest)
+        one = _validate_one(payload, rounds=rounds, warmup=warmup)
         one["elapsed_s"] = time.perf_counter() - t1
         if on_test is not None:
             on_test(1, one)
@@ -294,7 +323,7 @@ def validate(
             point_payload = make_sample_payload(seed, current_time_ms=anchor, fill_missing=False)
             if i == 1:
                 asset = str(point_payload["prompt"]["asset"])
-            one = _validate_one(point_payload, rounds=rounds, allow_rest=allow_rest)
+            one = _validate_one(point_payload, rounds=rounds, warmup=warmup if i == 1 else 0)
             one["elapsed_s"] = time.perf_counter() - t1
             reports.append(one)
             all_times.extend(one["predict_times_s"])
@@ -333,6 +362,96 @@ def validate(
         "last_target_utc": last["target_utc"],
         "end_ms": start_ms + time_length * time_interval * 1000,
         "end_utc": ms_to_utc(start_ms + time_length * time_interval * 1000),
+        "realized_price": display["realized_price"],
+        "crps": float(statistics.mean(crps_vals)) if crps_vals else None,
+        "crps_median": float(statistics.median(crps_vals)) if crps_vals else None,
+        "crps_min": min(crps_vals) if crps_vals else None,
+        "crps_max": max(crps_vals) if crps_vals else None,
+        "prepare_s": prepare_s,
+        "asset": asset,
+        "reports": reports,
+    }
+    if strict and not report["within_budget"]:
+        raise ValidationError(
+            f"median latency {report['median_ms']:.3f} ms exceeds "
+            f"{report['budget_ms']:.1f} ms budget"
+        )
+    return report
+
+
+def validate_saved_pairs(
+    database: Path,
+    *,
+    warmup: int = 1,
+    rounds: int = 1,
+    strict: bool = False,
+    on_test: Callable[[int, dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Score every ``database/{current_time_ms}`` payload against its saved book tick."""
+    pairs = list(iter_pairs(database))
+    if not pairs:
+        raise ValidationError(
+            f"no payload/book pairs under {database}. "
+            "Capture them with: python fetch_payload.py --interval 57.171"
+        )
+    t_prep = time.perf_counter()
+    prepare_s = time.perf_counter() - t_prep
+    reports: list[dict[str, Any]] = []
+    all_times: list[float] = []
+    asset = "BTC"
+    for i, (_folder, payload_file, book_file) in enumerate(pairs, start=1):
+        payload = load_payload(payload_file)
+        book = load_book(book_file)
+        asset = str(payload["prompt"].get("asset") or asset)
+        anchor = int(payload["prompt"]["current_time_ms"])
+        horizon = int(payload["prompt"].get("horizon_seconds", HORIZON_SECONDS))
+        realized = realized_from_saved_book(book, anchor, horizon)
+        t1 = time.perf_counter()
+        one = _validate_one(
+            payload,
+            rounds=rounds,
+            warmup=warmup if i == 1 else 0,
+            realized_price=realized,
+        )
+        one["elapsed_s"] = time.perf_counter() - t1
+        one["book_recv_ts_ms"] = book.get("recv_ts_ms")
+        reports.append(one)
+        all_times.extend(one["predict_times_s"])
+        if on_test is not None:
+            on_test(i, one)
+
+    median = statistics.median(all_times)
+    p95 = statistics.quantiles(all_times, n=20)[18] if len(all_times) >= 20 else max(all_times)
+    scored = [item for item in reports if item["crps"] is not None]
+    crps_vals = [float(item["crps"]) for item in scored]
+    first = reports[0]
+    last = reports[-1]
+    display = scored[0] if scored else first
+    report: dict[str, Any] = {
+        "ok": True,
+        "n": len(reports),
+        "n_scored": len(scored),
+        "n_dropped": len(reports) - len(scored),
+        "time_interval": 0,
+        "time_length": len(reports),
+        "median_ms": median * 1000.0,
+        "p95_ms": p95 * 1000.0,
+        "max_ms": max(all_times) * 1000.0,
+        "budget_ms": LATENCY_BUDGET_S * 1000.0,
+        "within_budget": median <= LATENCY_BUDGET_S,
+        "head": first["head"],
+        "tail": first["tail"],
+        "percentiles": first["percentiles"],
+        "current_time_ms": first["current_time_ms"],
+        "target_ms": first["target_ms"],
+        "current_time_utc": first["current_time_utc"],
+        "target_utc": first["target_utc"],
+        "last_current_time_ms": last["current_time_ms"],
+        "last_target_ms": last["target_ms"],
+        "last_current_time_utc": last["current_time_utc"],
+        "last_target_utc": last["target_utc"],
+        "end_ms": last["target_ms"],
+        "end_utc": last["target_utc"],
         "realized_price": display["realized_price"],
         "crps": float(statistics.mean(crps_vals)) if crps_vals else None,
         "crps_median": float(statistics.median(crps_vals)) if crps_vals else None,

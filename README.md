@@ -1,125 +1,54 @@
 # Synth Ultra
 
-Synth AI model for price simulations (Henry Bauer).
+An ultra-low-latency forecasting competition: predict the distribution of the
+**BTC price 10 seconds ahead**, from live Binance order-book and trade data, with
+a model that runs in **under 5 ms**.
 
-Your Synth registry repo (from onboarding):
-`asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner`
+Synth builds predictive models and applies them to financial markets. Synth Ultra
+targets the shortest horizons — short-term dynamics such as autocorrelation and
+order flow, and extracting the best estimate of the current price from deep,
+fast-moving crypto order books — with models that feed directly into Synth's
+trading systems.
 
-Your registry push key (keep this file local, never commit it):
-`vhft-henry-bauer-push-key.json`
+## What you build
 
-Your Bittensor identity (Synth subnet UID 46):
+A model that:
 
-| | |
-| --- | --- |
-| Wallet name | `bt` |
-| Coldkey | `5HaxR8qCeBmxeimWzQasnBq8ohkCxuRYT6YonXj59pm1TxYz` |
-| Hotkey | `5EWMaCP7GfRmcvi1Gzod14r6dZw1nsNZAN7hmDMZpNYoDegi` |
-| UID | 46 |
+- predicts **100 percentiles** of the BTC price **10 seconds** into the future,
+- runs in **under 5 ms** per prediction (strictly enforced), and
+- meets the technical specification so it runs directly in Synth's evaluation
+  environment.
 
-`client/submit.py --wallet bt --hotkey live2` reads the hotkey **file name** `live2`, not the SS58 address. After submit, the printed `hotkey :` line must be `5EWMaCP7GfRmcvi1Gzod14r6dZw1nsNZAN7hmDMZpNYoDegi`.
+Models are evaluated continuously on live market data; scores are visible to all
+participants.
 
+## Data available to the model
 
-# How to submit model to synth
+Each prediction, the model receives — for Binance **spot** and **USDT-M
+futures** (BTCUSDT):
 
-**Preparation:** Docker installed, plus a Python/bittensor environment (`uv` is enough for the client). Wallet `bt` with the hotkey above must exist on the machine that runs step 6 (`%USERPROFILE%\.bittensor\wallets\bt\hotkeys\` on Windows). This machine does not have those files yet — copy or recreate the wallet before submitting.
+- the last **1 hour** of 1-second candles (OHLCV),
+- an order-book snapshot to a set depth from ~**60 s** prior, every subsequent
+  order-book update, and the latest snapshot,
+- **60 s** of aggregate trades, and
+- **60 s** of book-ticker updates (best bid/ask price and size).
 
-Use `cat` on Linux (your VPS). Use `Get-Content` only on Windows PowerShell.
+Full schema: [`input.md`](input.md). Full competition spec:
+[`SPECIFICATION.md`](SPECIFICATION.md). Answers to the questions participants
+actually ask — the latency budget, call rate, the compute environment:
+[`FAQ.md`](FAQ.md).
 
-1. Build for the evaluation platform (`linux/amd64`):
+## Rewards & participation
 
-```
-docker build --platform linux/amd64 -t synth-ultra:v1 .
-```
+- **25%** of total subnet miner rewards are allocated to Synth Ultra.
+- Limited to **30 participants**.
+- **To join, ask us to register your hotkey** — see [`ONBOARDING.md`](ONBOARDING.md). You send a
+  hotkey and a handle, we create your registry repo and push key, and you collect the key
+  yourself over a signed request — we never email you a credential.
+- Your hotkey must already hold a **registered uid on subnet 50** before we can register you.
 
-2. Smoke-test that `predict_percentiles` imports inside the image:
+## Objective
 
-```
-docker run --rm --platform linux/amd64 --network=none --entrypoint python synth-ultra:v1 -c "from synth_ultra.model import predict_percentiles; print(predict_percentiles)"
-```
-
-3. Log in to Synth's Artifact Registry with **your** push key.
-
-Linux (your VPS):
-
-```
-cat vhft-henry-bauer-push-key.json | docker login -u _json_key --password-stdin https://asia-northeast1-docker.pkg.dev
-```
-
-Windows PowerShell only:
-
-```
-Get-Content vhft-henry-bauer-push-key.json -Raw | docker login -u _json_key --password-stdin https://asia-northeast1-docker.pkg.dev
-```
-
-4. Tag the image for **your** registry repo:
-
-```
-docker tag synth-ultra:v1 asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner:v1
-```
-
-5. Push. Copy the `sha256:` + 64 hex characters from the last lines of the output (do not copy any `<` `>` brackets — bash treats those as redirects):
-
-```
-docker push asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner:v1
-```
-
-If you already pushed, print the digest again:
-
-```
-docker inspect --format='{{index .RepoDigests 0}}' asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner:v1
-```
-
-That prints `.../miner@sha256:abc123...`. Use only the `sha256:abc123...` part.
-
-6. Sign and submit. On the VPS you already have `.venv` — install bittensor there and skip `uv`:
-
-```
-pip install "bittensor>=11,<12"
-python client/submit.py submit --wallet bt --hotkey live2 --image-uri asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner --image-digest sha256:006cd08546fcf1c492e9f2d1660546a661b84b2932af4d7f87adfa086ed91a4f --version 1
-```
-
-If you prefer `uv` later, install it with `curl -LsSf https://astral.sh/uv/install.sh | sh` (do not use snap). Confirm the client prints `hotkey : 5EWMaCP7GfRmcvi1Gzod14r6dZw1nsNZAN7hmDMZpNYoDegi`. If it prints a different address, you loaded the wrong hotkey file.
-
-7. Check status:
-
-```
-python client/submit.py status --wallet bt --hotkey live2
-```
-
-**IMPORTANT:** every model update needs a new digest and a strictly higher `--version`. Synth allows one submission per hotkey every 4 hours. After approval, a registered hotkey typically goes live within about 2 minutes.
-
-Version 1 was submitted at `2026-08-28 19:02 UTC`. The next submit is allowed at about `23:02 UTC`. You can rebuild and push anytime; only the `submit.py submit` call is rate-limited.
-
-
-# Update after a model change (VPS)
-
-On `~/ultra/ultra`, with `.venv` active:
-
-```
-git pull
-docker build --platform linux/amd64 -t synth-ultra:v2 .
-docker run --rm --platform linux/amd64 --network=none --entrypoint python synth-ultra:v2 -c "from synth_ultra.model import predict_percentiles; print(predict_percentiles)"
-cat vhft-henry-bauer-push-key.json | docker login -u _json_key --password-stdin https://asia-northeast1-docker.pkg.dev
-docker tag synth-ultra:v2 asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner:v2
-docker push asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner:v2
-docker inspect --format='{{index .RepoDigests 0}}' asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner:v2
-```
-
-Then, only after the 4-hour window, submit `--version 2` with the new `sha256:` digest from inspect (no angle brackets):
-
-```
-python client/submit.py submit --wallet bt --hotkey live2 --image-uri asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner --image-digest sha256:THE_NEW_DIGEST_FROM_INSPECT --version 2
-python client/submit.py status --wallet bt --hotkey live2
-```
-
-
-## Version history
-
-All times are UTC+9. Submit version is per-hotkey — Henry Bauer's first Synth submission is `--version 1`.
-
-|Version| Submit Version   |     Started      |                            Notes                              |
-|  ---  |       ---        |      ---         |                             ---                               |
-| 1.0   | 1                | 2026/08/29 04:02 | first submission under vhft-henry-bauer (pending review)      |
-| 2.0   | —                | 2026/08/25 09:35 | Rebuild with Synth base image V2 (no logic update)            |
-| 2.1   | —                | 2026/08/28 00:15 | Adjust model's parameters                                     |
+Build market-beating, ultra-low-latency predictive models that can generalize
+across assets and feed directly into Synth's trading systems — competing at the
+shortest market horizons, where HFT firms operate.

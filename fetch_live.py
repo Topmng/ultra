@@ -37,7 +37,12 @@ from synth_ultra.constants import (
     SCHEMA_VERSION,
     TRADE_WINDOW_S,
 )
-from synth_ultra.payload import ENV_PAYLOAD_JSON, payload_to_jsonable, assert_payload_schema
+from synth_ultra.payload import (
+    ENV_PAYLOAD_JSON,
+    assert_payload_schema,
+    history_is_complete,
+    payload_to_jsonable,
+)
 
 SYMBOL = "BTCUSDT"
 STREAM_SYMBOL = "btcusdt"
@@ -160,7 +165,7 @@ def rest_spot_candles_1s(start_ms: int, end_ms: int) -> dict:
     return {
         "open_time_ms": open_time,
         "ohlcv": ohlcv if ohlcv.ndim == 2 else ohlcv.reshape(-1, 5),
-        "complete_history": bool(open_time.size >= CANDLE_WINDOW_S),
+        "complete_history": history_is_complete(open_time),
     }
 
 
@@ -240,7 +245,7 @@ def rest_futures_candles_1s(start_ms: int, end_ms: int) -> dict:
     return {
         "open_time_ms": np.asarray(open_times, dtype=np.int64),
         "ohlcv": np.asarray(ohlcv_rows, dtype=np.float64),
-        "complete_history": False,
+        "complete_history": history_is_complete(np.asarray(open_times, dtype=np.int64)),
     }
 
 
@@ -290,44 +295,100 @@ def _ws_send_frame(sock: ssl.SSLSocket, opcode: int, payload: bytes) -> None:
     sock.sendall(bytes(header) + masked)
 
 
-def _ws_recv_exact(sock: ssl.SSLSocket, n: int) -> bytes:
-    buf: bytes = getattr(sock, "_ws_buf", b"")
-    while len(buf) < n:
-        chunk = sock.recv(max(n - len(buf), 4096))
+class _NeedMore(Exception):
+    """The socket buffer does not yet hold a complete websocket frame."""
+
+
+def _ws_read_available(sock: ssl.SSLSocket) -> None:
+    """Append whatever the socket has ready. A short read must not drop bytes."""
+    while True:
+        try:
+            chunk = sock.recv(65536)
+        except (TimeoutError, BlockingIOError, ssl.SSLWantReadError):
+            return
         if not chunk:
             raise ConnectionError("websocket closed")
-        buf += chunk
-    out, rest = buf[:n], buf[n:]
-    sock._ws_buf = rest  # type: ignore[attr-defined]
-    return out
+        sock._ws_buf = getattr(sock, "_ws_buf", b"") + chunk  # type: ignore[attr-defined]
 
 
-def _ws_recv_message(sock: ssl.SSLSocket) -> str | None:
-    payload = bytearray()
+def _take_ws_frame(buf: bytes) -> tuple[int, int, bytes, bytes] | None:
+    """Pop one frame. Returns ``(opcode, fin, payload, rest)`` or None if incomplete."""
+    if len(buf) < 2:
+        return None
+    fin = buf[0] >> 7
+    if buf[0] & 0x70:
+        raise ConnectionError("websocket RSV bits set")
+    opcode = buf[0] & 0x0F
+    masked = buf[1] & 0x80
+    length = buf[1] & 0x7F
+    pos = 2
+    if length == 126:
+        if len(buf) < pos + 2:
+            return None
+        length = struct.unpack("!H", buf[pos : pos + 2])[0]
+        pos += 2
+    elif length == 127:
+        if len(buf) < pos + 8:
+            return None
+        length = struct.unpack("!Q", buf[pos : pos + 8])[0]
+        pos += 8
+    if length > 8_000_000:
+        raise ConnectionError(f"websocket frame too large: {length}")
+    if masked:
+        if len(buf) < pos + 4 + length:
+            return None
+        mask = buf[pos : pos + 4]
+        pos += 4
+        data = bytes(b ^ mask[i % 4] for i, b in enumerate(buf[pos : pos + length]))
+    else:
+        if len(buf) < pos + length:
+            return None
+        data = buf[pos : pos + length]
+    return opcode, fin, data, buf[pos + length :]
+
+
+def _ws_next_text(sock: ssl.SSLSocket) -> str | None:
+    """One complete text message, or None for a close frame.
+
+    Raises ``_NeedMore`` when the buffer ends mid-frame. Bytes already read stay
+    on ``sock._ws_buf``.
+    """
+    buf: bytes = getattr(sock, "_ws_buf", b"")
+    frag: bytearray | None = getattr(sock, "_ws_frag", None)
     while True:
-        hdr = _ws_recv_exact(sock, 2)
-        fin = hdr[0] >> 7
-        opcode = hdr[0] & 0x0F
-        length = hdr[1] & 0x7F
-        if length == 126:
-            length = struct.unpack("!H", _ws_recv_exact(sock, 2))[0]
-        elif length == 127:
-            length = struct.unpack("!Q", _ws_recv_exact(sock, 8))[0]
-        if hdr[1] & 0x80:
-            mask = _ws_recv_exact(sock, 4)
-            data = bytes(b ^ mask[i % 4] for i, b in enumerate(_ws_recv_exact(sock, length)))
-        else:
-            data = _ws_recv_exact(sock, length)
+        frame = _take_ws_frame(buf)
+        if frame is None:
+            sock._ws_buf = buf  # type: ignore[attr-defined]
+            sock._ws_frag = frag  # type: ignore[attr-defined]
+            raise _NeedMore()
+        opcode, fin, data, buf = frame
         if opcode == 0x8:
+            sock._ws_buf = buf  # type: ignore[attr-defined]
+            sock._ws_frag = None  # type: ignore[attr-defined]
             return None
         if opcode == 0x9:
             _ws_send_frame(sock, 0xA, data)
             continue
         if opcode == 0xA:
             continue
-        payload.extend(data)
+        if opcode == 0x0:
+            if frag is None:
+                raise ConnectionError("websocket continuation without a start frame")
+            frag.extend(data)
+        elif opcode in (0x1, 0x2):
+            if frag is not None:
+                raise ConnectionError("websocket data frame interrupted a fragment")
+            frag = bytearray(data)
+        else:
+            raise ConnectionError(f"websocket opcode {opcode}")
         if fin:
-            return payload.decode("utf-8")
+            raw = bytes(frag)
+            sock._ws_buf = buf  # type: ignore[attr-defined]
+            sock._ws_frag = None  # type: ignore[attr-defined]
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ConnectionError("websocket payload is not utf-8") from exc
 
 
 @dataclass
@@ -335,6 +396,7 @@ class VenueBuf:
     trades: list[dict] = field(default_factory=list)
     book: list[dict] = field(default_factory=list)
     depth_updates: list[dict] = field(default_factory=list)
+    klines: list[dict] = field(default_factory=list)
     last_recv: dict[str, int] = field(default_factory=dict)
 
 
@@ -344,6 +406,31 @@ class LiveCapture:
     depth_start: dict[str, dict]
     depth_latest: dict[str, dict]
     venues: dict[str, VenueBuf]
+
+
+def _is_book_ticker(name: str, data: dict) -> bool:
+    """Spot bookTicker has no event name. Depth diffs use ``b``/``a`` arrays, not ``B``/``A``."""
+    if name == "bookTicker" or data.get("e") == "bookTicker":
+        return True
+    if data.get("e") in ("aggTrade", "depthUpdate", "kline", "trade") or "U" in data:
+        return False
+    try:
+        float(data["b"])
+        float(data["B"])
+        float(data["a"])
+        float(data["A"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _prev_final_id(data: dict, buf: VenueBuf) -> int:
+    """Futures sends ``pu``. Spot does not, so chain the previous event's final id."""
+    if data.get("pu") is not None:
+        return int(data["pu"])
+    if buf.depth_updates:
+        return int(buf.depth_updates[-1]["final_id"])
+    return int(data["U"]) - 1
 
 
 def _parse_ws(stream: str, data: dict, recv_ms: int, *, futures: bool, buf: VenueBuf) -> None:
@@ -361,9 +448,7 @@ def _parse_ws(stream: str, data: dict, recv_ms: int, *, futures: bool, buf: Venu
         )
         buf.last_recv["trade"] = recv_ms
         return
-    if name == "bookTicker" or (
-        "b" in data and "B" in data and "a" in data and "A" in data and "U" not in data
-    ):
+    if _is_book_ticker(name, data):
         row: dict[str, Any] = {
             "recv_ts_ms": recv_ms,
             "bid_price": float(data["b"]),
@@ -383,7 +468,7 @@ def _parse_ws(stream: str, data: dict, recv_ms: int, *, futures: bool, buf: Venu
             "event_ts_ms": np.int64(data["E"]),
             "first_id": int(data["U"]),
             "final_id": int(data["u"]),
-            "prev_final_id": int(data["pu"]) if data.get("pu") is not None else int(data["U"]) - 1,
+            "prev_final_id": _prev_final_id(data, buf),
             "bids": np.asarray(
                 [[float(p), float(q)] for p, q in data.get("b") or []], dtype=np.float64
             ).reshape(-1, 2),
@@ -391,23 +476,39 @@ def _parse_ws(stream: str, data: dict, recv_ms: int, *, futures: bool, buf: Venu
                 [[float(p), float(q)] for p, q in data.get("a") or []], dtype=np.float64
             ).reshape(-1, 2),
         }
-        if futures:
+        if futures and data.get("T") is not None:
             upd["transaction_ts_ms"] = np.int64(data["T"])
         buf.depth_updates.append(upd)
         buf.last_recv["depth"] = recv_ms
         return
     if name.startswith("kline") or data.get("e") == "kline":
+        k = data.get("k") if isinstance(data.get("k"), dict) else None
+        if k and k.get("t") is not None:
+            buf.klines.append(
+                {
+                    "open_time_ms": int(k["t"]),
+                    "open": float(k["o"]),
+                    "high": float(k["h"]),
+                    "low": float(k["l"]),
+                    "close": float(k["c"]),
+                    "volume": float(k["v"]),
+                    "closed": bool(k.get("x")),
+                }
+            )
         buf.last_recv["kline_1s"] = recv_ms
+        return
 
 
-RAW_STREAMS: list[tuple[str, str, int, str]] = [
-    ("spot", "stream.binance.com", 9443, f"{STREAM_SYMBOL}@aggTrade"),
-    ("spot", "stream.binance.com", 9443, f"{STREAM_SYMBOL}@bookTicker"),
-    ("spot", "stream.binance.com", 9443, f"{STREAM_SYMBOL}@depth@100ms"),
-    ("spot", "stream.binance.com", 9443, f"{STREAM_SYMBOL}@kline_1s"),
-    ("futures", "fstream.binance.com", 443, f"{STREAM_SYMBOL}@aggTrade"),
-    ("futures", "fstream.binance.com", 443, f"{STREAM_SYMBOL}@bookTicker"),
-    ("futures", "fstream.binance.com", 443, f"{STREAM_SYMBOL}@depth@100ms"),
+# USD-M futures retired the single /ws/ path: aggTrade is /market, book and
+# depth are /public. Spot still uses /ws/.
+RAW_STREAMS: list[tuple[str, str, int, str, str]] = [
+    ("spot", "stream.binance.com", 9443, f"/ws/{STREAM_SYMBOL}@aggTrade", f"{STREAM_SYMBOL}@aggTrade"),
+    ("spot", "stream.binance.com", 9443, f"/ws/{STREAM_SYMBOL}@bookTicker", f"{STREAM_SYMBOL}@bookTicker"),
+    ("spot", "stream.binance.com", 9443, f"/ws/{STREAM_SYMBOL}@depth@100ms", f"{STREAM_SYMBOL}@depth@100ms"),
+    ("spot", "stream.binance.com", 9443, f"/ws/{STREAM_SYMBOL}@kline_1s", f"{STREAM_SYMBOL}@kline_1s"),
+    ("futures", "fstream.binance.com", 443, f"/market/ws/{STREAM_SYMBOL}@aggTrade", f"{STREAM_SYMBOL}@aggTrade"),
+    ("futures", "fstream.binance.com", 443, f"/public/ws/{STREAM_SYMBOL}@bookTicker", f"{STREAM_SYMBOL}@bookTicker"),
+    ("futures", "fstream.binance.com", 443, f"/public/ws/{STREAM_SYMBOL}@depth@100ms", f"{STREAM_SYMBOL}@depth@100ms"),
 ]
 
 
@@ -423,7 +524,10 @@ def _ingest_text(
     if not isinstance(data, dict):
         return
     stream = str(msg.get("stream") or data.get("e") or stream_name)
-    _parse_ws(stream, data, recv_ms, futures=(venue == "futures"), buf=bufs[venue])
+    try:
+        _parse_ws(stream, data, recv_ms, futures=(venue == "futures"), buf=bufs[venue])
+    except (KeyError, TypeError, ValueError):
+        return
 
 
 def _drain_socket(
@@ -431,12 +535,16 @@ def _drain_socket(
 ) -> None:
     sock.settimeout(0.0)
     try:
+        _ws_read_available(sock)
         while True:
-            text = _ws_recv_message(sock)
+            try:
+                text = _ws_next_text(sock)
+            except _NeedMore:
+                return
             if text is None:
-                break
+                raise ConnectionError(f"websocket closed: {venue} {stream_name}")
             _ingest_text(text, venue, stream_name, _now_ms(), bufs)
-    except (TimeoutError, BlockingIOError, ssl.SSLWantReadError, ConnectionError):
+    except (TimeoutError, BlockingIOError, ssl.SSLWantReadError):
         pass
     finally:
         sock.settimeout(1.0)
@@ -444,11 +552,11 @@ def _drain_socket(
 
 def record_live_window(window_s: float) -> LiveCapture:
     """Subscribe first, snapshot depth_start, record `window_s`, snapshot depth_latest."""
-    socks: dict[ssl.SSLSocket, tuple[str, str, int, str]] = {}
+    socks: dict[ssl.SSLSocket, tuple[str, str, int, str, str]] = {}
     bufs = {"spot": VenueBuf(), "futures": VenueBuf()}
-    for venue, host, port, stream_name in RAW_STREAMS:
-        sock = _ws_connect(host, f"/ws/{stream_name}", port)
-        socks[sock] = (venue, host, port, stream_name)
+    for venue, host, port, path, stream_name in RAW_STREAMS:
+        sock = _ws_connect(host, path, port)
+        socks[sock] = (venue, host, port, path, stream_name)
         print(f"  ws {venue} {stream_name} connected", flush=True)
 
     depth_start = {
@@ -468,7 +576,7 @@ def record_live_window(window_s: float) -> LiveCapture:
         while time.time() < deadline and socks:
             readable, _, _ = select.select(list(socks.keys()), [], [], 1.0)
             for sock in readable:
-                venue, host, port, stream_name = socks[sock]
+                venue, host, port, path, stream_name = socks[sock]
                 try:
                     _drain_socket(sock, venue, stream_name, bufs)
                 except (ConnectionError, OSError) as exc:
@@ -478,8 +586,8 @@ def record_live_window(window_s: float) -> LiveCapture:
                     except OSError:
                         pass
                     socks.pop(sock, None)
-                    fresh = _ws_connect(host, f"/ws/{stream_name}", port)
-                    socks[fresh] = (venue, host, port, stream_name)
+                    fresh = _ws_connect(host, path, port)
+                    socks[fresh] = (venue, host, port, path, stream_name)
                     print(f"  ws {venue} {stream_name} reconnected", flush=True)
             if time.time() - last_print >= 5.0:
                 remain = max(deadline - time.time(), 0.0)
@@ -492,7 +600,7 @@ def record_live_window(window_s: float) -> LiveCapture:
                     flush=True,
                 )
                 last_print = time.time()
-        for sock, (venue, _host, _port, stream_name) in list(socks.items()):
+        for sock, (venue, _host, _port, _path, stream_name) in list(socks.items()):
             _drain_socket(sock, venue, stream_name, bufs)
     finally:
         for sock in list(socks.keys()):
@@ -566,15 +674,28 @@ def _stack_book(rows: list[dict], *, futures: bool) -> dict:
 def _filter_depth_updates(
     rows: list[dict], start: dict, lo_ms: int, hi_ms: int
 ) -> list[dict]:
+    """Diffs between depth_start and now whose final id is not already in the snapshot.
+
+    A diff that arrived a moment before the REST response was stamped is kept
+    when its id range still overlaps the snapshot. Those are the events the
+    Binance book-sync procedure applies first.
+    """
     start_id = int(start["update_id"])
+    start_recv = int(start["recv_ts_ms"])
     out: list[dict] = []
     for row in rows:
         recv = int(row["recv_ts_ms"])
-        if recv <= lo_ms or recv > hi_ms:
+        final_id = int(row["final_id"])
+        if final_id < start_id or recv > hi_ms:
             continue
-        if int(row["final_id"]) < start_id:
-            continue
-        out.append(row)
+        in_window = lo_ms < recv <= hi_ms
+        bridge = (
+            not in_window
+            and recv > start_recv - 2000
+            and int(row["first_id"]) <= start_id + 1
+        )
+        if in_window or bridge:
+            out.append(row)
     return out
 
 
@@ -591,14 +712,15 @@ def assemble_venue(
     trades = _stack_trades(_window_rows(buf.trades, lo_ms, hi_ms))
     book = _stack_book(_window_rows(buf.book, lo_ms, hi_ms), futures=futures)
     updates = _filter_depth_updates(buf.depth_updates, depth_start, lo_ms, hi_ms)
-    last = dict(buf.last_recv)
-    last.setdefault("trade", int(trades["recv_ts_ms"][-1]) if trades["recv_ts_ms"].size else hi_ms)
-    last.setdefault("bookTicker", int(book["recv_ts_ms"][-1]) if book["recv_ts_ms"].size else hi_ms)
-    last.setdefault("depth", int(depth_latest["recv_ts_ms"]))
-    last.setdefault(
-        "kline_1s",
-        int(candles["open_time_ms"][-1]) if candles["open_time_ms"].size else hi_ms,
-    )
+    last: dict[str, int] = {"depth": int(depth_latest["recv_ts_ms"])}
+    if trades["recv_ts_ms"].size:
+        last["trade"] = int(trades["recv_ts_ms"][-1])
+    if book["recv_ts_ms"].size:
+        last["bookTicker"] = int(book["recv_ts_ms"][-1])
+    if "kline_1s" in buf.last_recv:
+        last["kline_1s"] = int(buf.last_recv["kline_1s"])
+    if updates:
+        last["depth"] = max(last["depth"], int(updates[-1]["recv_ts_ms"]))
     return {
         "symbol": SYMBOL,
         "candles_1s": candles,
@@ -628,7 +750,7 @@ def assemble_payload(
             "num_percentiles": NUM_PERCENTILES,
             "quantile_grid": "centered-100",
             "current_time_ms": int(current_time_ms),
-            "trigger": trigger or {"kind": "interval", "venue": None},
+            "trigger": trigger or {"kind": "time", "venue": None},
         },
         "venues": {
             "spot": assemble_venue(
@@ -726,15 +848,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pretty", action="store_true", help="indent JSON")
     parser.add_argument(
         "--trigger",
-        choices=("interval", "trade", "book"),
-        default="interval",
-        help="prompt.trigger.kind",
+        choices=("time", "event", "event_delayed"),
+        default="time",
+        help="prompt.trigger.kind (input.md)",
+    )
+    parser.add_argument(
+        "--trigger-venue",
+        choices=("spot", "futures"),
+        default=None,
+        help="venue that fired an event trigger; omit for a time trigger",
     )
     args = parser.parse_args(argv)
+    if args.trigger == "time" and args.trigger_venue is not None:
+        parser.error("a time trigger has venue null")
+    if args.trigger != "time" and args.trigger_venue is None:
+        parser.error("--trigger-venue is required when --trigger is event or event_delayed")
+    if args.window_seconds < TRADE_WINDOW_S:
+        print(
+            f"window {args.window_seconds:.0f}s is shorter than the 60s trades/book window",
+            file=sys.stderr,
+        )
     try:
         payload = capture_env_payload(
             window_s=args.window_seconds,
-            trigger={"kind": args.trigger, "venue": None},
+            trigger={"kind": args.trigger, "venue": args.trigger_venue},
         )
     except Exception as exc:
         print(f"FAIL: {exc}", file=sys.stderr)

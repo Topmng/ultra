@@ -248,6 +248,24 @@ def test_migrate_legacy_data_files(tmp_path):
     assert not (src / "btc_spot_candles.csv").exists()
 
 
+def test_parse_spot_book_ticker_uses_transaction_time_not_update_id():
+    parsed = _parse_book_ticker_row(
+        ["400900217", "100.0", "1.5", "100.1", "2.0", "1705276800000"],
+        futures=False,
+    )
+    assert parsed is not None
+    recv, bid_p, bid_q, ask_p, ask_q, event, tx, uid = parsed
+    assert recv == 1_705_276_800_000
+    assert bid_p == 100.0
+    assert ask_q == 2.0
+    assert event is None and tx is None
+    assert uid == 400_900_217
+    assert _parse_book_ticker_row(
+        ["400900217", "100.0", "1.5", "100.1", "2.0"],
+        futures=False,
+    ) is None
+
+
 def test_book_ticker_from_candle_uses_close_and_spread():
     template = {
         "bid_price": 100.0,

@@ -18,6 +18,8 @@ from synth_ultra.constants import (
     NUM_PERCENTILES,
     SCHEMA_VERSION,
     TRADE_WINDOW_S,
+    TRIGGER_KINDS,
+    TRIGGER_VENUES,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -40,7 +42,6 @@ SPOT_BOOK_TICKER_CSV = _data_csv("btc_spot_book_ticker.csv")
 FUTURES_BOOK_TICKER_CSV = _data_csv("btc_futures_book_ticker.csv")
 SPOT_DEPTH_CSV = _data_csv("btc_spot_depth.csv")
 FUTURES_DEPTH_CSV = _data_csv("btc_futures_depth.csv")
-FUTURES_BOOK_DEPTH_CSV = _data_csv("btc_futures_book_depth.csv")
 SPOT_DEPTH_UPDATES_JSONL = _data_csv("btc_spot_depth_updates.jsonl")
 FUTURES_DEPTH_UPDATES_JSONL = _data_csv("btc_futures_depth_updates.jsonl")
 
@@ -64,23 +65,41 @@ def _candles(
     open_[0] = px
     open_[1:] = close[:-1]
     vol = rng.uniform(0.1, 4.0, size=n)
+    high = np.maximum(high, np.maximum(open_, close))
+    low = np.minimum(low, np.minimum(open_, close))
     ohlcv = np.stack([open_, high, low, close, vol], axis=1)
     open_time_ms = t0 + np.arange(n, dtype=np.int64) * 1000
     return {
         "open_time_ms": open_time_ms,
         "ohlcv": ohlcv,
-        "complete_history": bool(complete),
+        "complete_history": bool(complete) and history_is_complete(open_time_ms),
     }
 
 
+def history_is_complete(open_time_ms: np.ndarray) -> bool:
+    """True when the candle array holds a full trailing hour of 1s bars.
+
+    input.md: ``complete_history`` is whether that hour is populated. Spot
+    evaluation payloads are complete; futures is false while its trade-built
+    history is still filling and then contains only the seconds available.
+    """
+    times = np.asarray(open_time_ms)
+    if times.size < CANDLE_WINDOW_S:
+        return False
+    return int(times[-1]) - int(times[0]) >= (CANDLE_WINDOW_S - 1) * 1000
+
+
 def _trades(n: int, t0: int, px: float, rng: np.random.Generator) -> dict:
-    ts = t0 + rng.integers(0, TRADE_WINDOW_S * 1000, size=n, dtype=np.int64)
-    ts.sort()
+    # Trailing 60s is (t0, t0 + 60_000], t0 = current_time_ms - 60_000.
+    ts = t0 + rng.integers(1, TRADE_WINDOW_S * 1000 + 1, size=n, dtype=np.int64)
     price = px * np.exp(rng.normal(0.0, 4e-5, size=n))
     qty = rng.uniform(0.001, 0.8, size=n)
     maker = rng.random(n) < 0.5
     event = ts + rng.integers(0, 3, size=n, dtype=np.int64)
     recv = event + rng.integers(0, 8, size=n, dtype=np.int64)
+    order = np.argsort(recv, kind="mergesort")
+    ts, event, recv = ts[order], event[order], recv[order]
+    price, qty, maker = price[order], qty[order], maker[order]
     return {
         "ts_ms": ts,
         "event_ts_ms": event,
@@ -94,7 +113,7 @@ def _trades(n: int, t0: int, px: float, rng: np.random.Generator) -> dict:
 def _book_ticker(
     n: int, t0: int, px: float, rng: np.random.Generator, *, futures: bool
 ) -> dict:
-    recv = t0 + np.linspace(0, BOOK_TICKER_WINDOW_S * 1000, n, dtype=np.int64)
+    recv = np.linspace(t0 + 1, t0 + BOOK_TICKER_WINDOW_S * 1000, n, dtype=np.int64)
     mid = px * np.exp(np.cumsum(rng.normal(0.0, 8e-6, size=n)))
     half = 0.5 * rng.uniform(0.5, 2.5, size=n)
     bid_p = mid - half
@@ -203,6 +222,20 @@ def _empty_trades() -> dict[str, np.ndarray]:
     }
 
 
+def _order_by_time(times: np.ndarray, arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Oldest-first. searchsorted windows are wrong on an unsorted clock."""
+    if times.size < 2 or bool(np.all(times[1:] >= times[:-1])):
+        return arrays
+    order = np.argsort(times, kind="mergesort")
+    out: dict[str, np.ndarray] = {}
+    for name, arr in arrays.items():
+        if isinstance(arr, np.ndarray) and arr.shape[:1] == times.shape:
+            out[name] = arr[order]
+        else:
+            out[name] = arr
+    return out
+
+
 def _parse_maker_column(path: Path, n: int) -> np.ndarray:
     maker = np.empty(n, dtype=bool)
     with path.open("rb") as handle:
@@ -228,10 +261,11 @@ def _load_candles_csv(path_str: str) -> dict[str, np.ndarray] | None:
         return None
     cached = _try_npz(path)
     if cached is not None and "open_time_ms" in cached and "ohlcv" in cached:
-        return {
+        out = {
             "open_time_ms": cached["open_time_ms"].astype(np.int64, copy=False),
             "ohlcv": cached["ohlcv"].astype(np.float64, copy=False),
         }
+        return _order_by_time(out["open_time_ms"], out)
     try:
         arr = np.loadtxt(path, delimiter=",", skiprows=1, usecols=(0, 2, 3, 4, 5, 6))
     except Exception:
@@ -247,6 +281,7 @@ def _load_candles_csv(path_str: str) -> dict[str, np.ndarray] | None:
         "open_time_ms": arr[:, 0].astype(np.int64, copy=False),
         "ohlcv": arr[:, 1:6].astype(np.float64, copy=False),
     }
+    out = _order_by_time(out["open_time_ms"], out)
     _write_npz(path, out)
     return out
 
@@ -258,14 +293,29 @@ def _load_trades_csv(path_str: str) -> dict[str, np.ndarray] | None:
         return None
     cached = _try_npz(path)
     if cached is not None and "ts_ms" in cached:
-        return {
+        out = {
             "ts_ms": cached["ts_ms"].astype(np.int64, copy=False),
             "price": cached["price"].astype(np.float64, copy=False),
             "qty": cached["qty"].astype(np.float64, copy=False),
             "buyer_is_maker": cached["buyer_is_maker"].astype(bool, copy=False),
         }
+        for name in ("event_ts_ms", "recv_ts_ms"):
+            if name in cached:
+                out[name] = cached[name].astype(np.int64, copy=False)
+        return _order_by_time(out["recv_ts_ms"] if "recv_ts_ms" in out else out["ts_ms"], out)
+    with path.open(newline="", encoding="utf-8") as handle:
+        header = handle.readline()
+    if not header.strip():
+        return _empty_trades()
+    names = [part.strip() for part in header.split(",")]
+    idx = {name: i for i, name in enumerate(names)}
+    required = ("ts_ms", "price", "qty")
+    if any(name not in idx for name in required):
+        return _empty_trades()
+    extra = [name for name in ("event_ts_ms", "recv_ts_ms") if name in idx]
+    usecols = [idx[name] for name in ("ts_ms", "price", "qty", *extra)]
     try:
-        numeric = np.loadtxt(path, delimiter=",", skiprows=1, usecols=(1, 3, 4), dtype=np.float64)
+        numeric = np.loadtxt(path, delimiter=",", skiprows=1, usecols=usecols, dtype=np.float64)
     except Exception:
         return _empty_trades()
     if numeric.size == 0:
@@ -280,6 +330,9 @@ def _load_trades_csv(path_str: str) -> dict[str, np.ndarray] | None:
         "qty": numeric[:n, 2].astype(np.float64, copy=False),
         "buyer_is_maker": maker[:n],
     }
+    for i, name in enumerate(extra, start=3):
+        out[name] = numeric[:n, i].astype(np.int64, copy=False)
+    out = _order_by_time(out["recv_ts_ms"] if "recv_ts_ms" in out else out["ts_ms"], out)
     _write_npz(path, out)
     return out
 
@@ -300,14 +353,13 @@ def _candles_at(path: Path, current_time_ms: int, *, compact: bool) -> dict | No
     ohlcv = table["ohlcv"][sl]
     if open_time_ms.size == 0:
         return None
-    complete = int(open_time_ms.size) >= CANDLE_WINDOW_S
     if compact and open_time_ms.size > 8:
         open_time_ms = open_time_ms[-8:]
         ohlcv = ohlcv[-8:]
     return {
         "open_time_ms": np.ascontiguousarray(open_time_ms, dtype=np.int64),
         "ohlcv": np.ascontiguousarray(ohlcv, dtype=np.float64),
-        "complete_history": bool(complete),
+        "complete_history": history_is_complete(open_time_ms),
     }
 
 
@@ -315,26 +367,39 @@ def _trades_at(path: Path, current_time_ms: int, *, compact: bool) -> dict | Non
     table = _load_trades_csv(str(path))
     if table is None:
         return None
-    times = table["ts_ms"]
+    # input.md windows use recv_ts_ms. Vision aggTrades only publish exchange
+    # trade time T, so a historical CSV without recv_ts_ms is windowed on T
+    # and that value is copied into recv_ts_ms. Live captures keep both clocks.
+    clock_name = "recv_ts_ms" if "recv_ts_ms" in table else "ts_ms"
+    times = table[clock_name]
     sl = _window_slice(times, current_time_ms - TRADE_WINDOW_S * 1000, current_time_ms)
-    ts = times[sl]
+    ts = table["ts_ms"][sl]
     if ts.size == 0:
         return None
+    event = table["event_ts_ms"][sl] if "event_ts_ms" in table else None
+    recv = table["recv_ts_ms"][sl] if "recv_ts_ms" in table else None
+    price = table["price"][sl]
+    qty = table["qty"][sl]
+    maker = table["buyer_is_maker"][sl]
     if compact and ts.size > 6:
         sl_last = slice(ts.size - 6, ts.size)
         ts = ts[sl_last]
-        price = table["price"][sl][sl_last]
-        qty = table["qty"][sl][sl_last]
-        maker = table["buyer_is_maker"][sl][sl_last]
-    else:
-        price = table["price"][sl]
-        qty = table["qty"][sl]
-        maker = table["buyer_is_maker"][sl]
+        price = price[sl_last]
+        qty = qty[sl_last]
+        maker = maker[sl_last]
+        if event is not None:
+            event = event[sl_last]
+        if recv is not None:
+            recv = recv[sl_last]
     ts = np.ascontiguousarray(ts, dtype=np.int64)
+    if event is None:
+        event = ts.copy()
+    if recv is None:
+        recv = ts.copy()
     return {
         "ts_ms": ts,
-        "event_ts_ms": ts.copy(),
-        "recv_ts_ms": ts.copy(),
+        "event_ts_ms": np.ascontiguousarray(event, dtype=np.int64),
+        "recv_ts_ms": np.ascontiguousarray(recv, dtype=np.int64),
         "price": np.ascontiguousarray(price, dtype=np.float64),
         "qty": np.ascontiguousarray(qty, dtype=np.float64),
         "buyer_is_maker": np.ascontiguousarray(maker, dtype=bool),
@@ -357,7 +422,7 @@ def _load_book_ticker_csv(path_str: str) -> dict[str, np.ndarray] | None:
         return None
     cached = _try_npz(path)
     if cached is not None and "recv_ts_ms" in cached:
-        return cached
+        return _order_by_time(np.asarray(cached["recv_ts_ms"], dtype=np.int64), cached)
     with path.open(newline="", encoding="utf-8") as handle:
         header = handle.readline()
     if not header.strip():
@@ -385,7 +450,7 @@ def _load_book_ticker_csv(path_str: str) -> dict[str, np.ndarray] | None:
         if extra:
             out["event_ts_ms"] = np.array([], dtype=np.int64)
             out["transaction_ts_ms"] = np.array([], dtype=np.int64)
-        return out
+        return _order_by_time(out["recv_ts_ms"], out)
     if arr.ndim == 1:
         arr = arr.reshape(1, -1)
     out = {
@@ -397,6 +462,7 @@ def _load_book_ticker_csv(path_str: str) -> dict[str, np.ndarray] | None:
     }
     for i, name in enumerate(extra, start=5):
         out[name] = arr[:, i].astype(np.int64, copy=False)
+    out = _order_by_time(out["recv_ts_ms"], out)
     _write_npz(path, out)
     return out
 
@@ -452,7 +518,12 @@ def _book_ticker_at(path: Path, current_time_ms: int, *, compact: bool, futures:
 def _percent_levels_to_book(
     pct: np.ndarray, depth: np.ndarray, notional: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Turn Vision bookDepth (% from mid, cumulative qty) into best-first [price, qty]."""
+    """Approximate price levels from Vision bookDepth percent bins.
+
+    bookDepth is cumulative size at a percent from mid, not the competition's
+    ``[price, qty]`` book. Payload depth must come from REST or diff-depth,
+    not from this conversion.
+    """
     pct = np.asarray(pct, dtype=np.float64)
     depth = np.asarray(depth, dtype=np.float64)
     notional = np.asarray(notional, dtype=np.float64)
@@ -480,74 +551,6 @@ def _percent_levels_to_book(
         return np.asarray(levels, dtype=np.float64)
 
     return side(bid_i), side(ask_i)
-
-
-@functools.lru_cache(maxsize=4)
-def _load_book_depth_csv(path_str: str) -> dict[str, np.ndarray] | None:
-    path = Path(path_str)
-    if not path.is_file():
-        return None
-    cached = _try_npz(path)
-    if cached is not None and "ts_ms" in cached:
-        arr_ts = cached["ts_ms"].astype(np.int64, copy=False)
-        percentage = cached["percentage"].astype(np.float64, copy=False)
-        depth = cached["depth"].astype(np.float64, copy=False)
-        notional = cached["notional"].astype(np.float64, copy=False)
-    else:
-        try:
-            arr = np.loadtxt(path, delimiter=",", skiprows=1, usecols=(0, 2, 3, 4))
-        except Exception:
-            return None
-        if arr.size == 0:
-            return None
-        if arr.ndim == 1:
-            arr = arr.reshape(1, -1)
-        arr_ts = arr[:, 0].astype(np.int64, copy=False)
-        percentage = arr[:, 1].astype(np.float64, copy=False)
-        depth = arr[:, 2].astype(np.float64, copy=False)
-        notional = arr[:, 3].astype(np.float64, copy=False)
-        _write_npz(
-            path,
-            {
-                "ts_ms": arr_ts,
-                "percentage": percentage,
-                "depth": depth,
-                "notional": notional,
-            },
-        )
-    uniq, starts = np.unique(arr_ts, return_index=True)
-    ends = np.empty_like(starts)
-    ends[:-1] = starts[1:]
-    ends[-1] = arr_ts.size
-    return {
-        "ts_ms": arr_ts,
-        "percentage": percentage,
-        "depth": depth,
-        "notional": notional,
-        "uniq_ts": uniq,
-        "starts": starts,
-        "ends": ends,
-    }
-
-
-def _snapshot_from_book_depth(table: dict[str, np.ndarray], t_ms: int, *, futures: bool) -> dict | None:
-    uniq = table["uniq_ts"]
-    i = int(np.searchsorted(uniq, t_ms, side="right") - 1)
-    if i < 0:
-        return None
-    sl = slice(int(table["starts"][i]), int(table["ends"][i]))
-    bids, asks = _percent_levels_to_book(
-        table["percentage"][sl], table["depth"][sl], table["notional"][sl]
-    )
-    ts = int(uniq[i])
-    return {
-        "recv_ts_ms": np.int64(ts),
-        "update_id": ts,
-        "bids": bids,
-        "asks": asks,
-        "event_ts_ms": ts if futures else None,
-        "transaction_ts_ms": ts if futures else None,
-    }
 
 
 def _encode_depth_snaps(snaps: list[dict]) -> dict[str, np.ndarray]:
@@ -683,6 +686,7 @@ def _parse_depth_snapshot_csv(path: Path) -> list[dict] | None:
                 "transaction_ts_ms": tx_l[lo],
             }
         )
+    snaps.sort(key=lambda snap: int(snap["recv_ts_ms"]))
     return snaps
 
 
@@ -693,7 +697,9 @@ def _load_depth_snapshot_csv(path_str: str) -> list[dict] | None:
         return None
     cached = _try_npz(path)
     if cached is not None and "recv_ts_ms" in cached and "bid_off" in cached:
-        return _decode_depth_snaps(cached)
+        snaps = _decode_depth_snaps(cached)
+        snaps.sort(key=lambda snap: int(snap["recv_ts_ms"]))
+        return snaps
     snaps = _parse_depth_snapshot_csv(path)
     if snaps:
         _write_npz(path, _encode_depth_snaps(snaps))
@@ -838,14 +844,12 @@ def _depth_bundle_at(
     snaps = _load_depth_snapshot_csv(str(snap_path))
     start = _last_snapshot_at(snaps, t0)
     latest = _last_snapshot_at(snaps, current_time_ms)
-    if futures:
-        book_depth = _load_book_depth_csv(str(FUTURES_BOOK_DEPTH_CSV))
-        if book_depth is not None:
-            if start is None:
-                start = _snapshot_from_book_depth(book_depth, t0, futures=True)
-            if latest is None:
-                latest = _snapshot_from_book_depth(book_depth, current_time_ms, futures=True)
-    updates = _depth_updates_at(upd_path, t0, current_time_ms, compact=compact, futures=futures)
+    # Diffs are the messages between depth_start and now (input.md), so the
+    # window opens at the snapshot receive time, not at a later clock boundary.
+    update_lo = int(start["recv_ts_ms"]) if start is not None else t0
+    updates = _depth_updates_at(
+        upd_path, update_lo, current_time_ms, compact=compact, futures=futures
+    )
     real_start = start is not None
     real_latest = latest is not None
     if start is None:
@@ -894,7 +898,6 @@ def preload_venue_csvs() -> None:
         ("btc_futures_book_ticker.csv", FUTURES_BOOK_TICKER_CSV, _load_book_ticker_csv),
         ("btc_spot_depth.csv", SPOT_DEPTH_CSV, _load_depth_snapshot_csv),
         ("btc_futures_depth.csv", FUTURES_DEPTH_CSV, _load_depth_snapshot_csv),
-        ("btc_futures_book_depth.csv", FUTURES_BOOK_DEPTH_CSV, _load_book_depth_csv),
         ("btc_spot_depth_updates.jsonl", SPOT_DEPTH_UPDATES_JSONL, _load_depth_updates_jsonl),
         ("btc_futures_depth_updates.jsonl", FUTURES_DEPTH_UPDATES_JSONL, _load_depth_updates_jsonl),
     ]
@@ -941,7 +944,7 @@ def _venue(
         candles = (
             _candles(
                 n_candles,
-                current_time_ms - n_candles * 1000,
+                current_time_ms - (n_candles - 1) * 1000,
                 px,
                 rng,
                 complete_candles,
@@ -971,19 +974,14 @@ def _venue(
         synthetic=synthetic,
         fill_missing=fill_missing or synthetic,
     )
-    last_trade = (
-        int(trades["recv_ts_ms"][-1]) if trades["recv_ts_ms"].size else current_time_ms
-    )
-    last_kline = int(candles["open_time_ms"][-1]) if candles["open_time_ms"].size else current_time_ms
-    last_book = (
-        int(book_ticker["recv_ts_ms"][-1]) if book_ticker["recv_ts_ms"].size else current_time_ms
-    )
-    last_event_times = {
-        "trade": np.int64(last_trade),
-        "depth": np.int64(latest["recv_ts_ms"]),
-        "bookTicker": np.int64(last_book),
-        "kline_1s": np.int64(last_kline),
-    }
+    last_event_times: dict[str, np.int64] = {}
+    if trades["recv_ts_ms"].size:
+        last_event_times["trade"] = np.int64(int(trades["recv_ts_ms"][-1]))
+    if book_ticker["recv_ts_ms"].size:
+        last_event_times["bookTicker"] = np.int64(int(book_ticker["recv_ts_ms"][-1]))
+    if candles["open_time_ms"].size:
+        last_event_times["kline_1s"] = np.int64(int(candles["open_time_ms"][-1]))
+    last_event_times["depth"] = np.int64(int(latest["recv_ts_ms"]))
     return {
         "symbol": "BTCUSDT",
         "candles_1s": candles,
@@ -1026,7 +1024,7 @@ def make_sample_payload(
             "num_percentiles": NUM_PERCENTILES,
             "quantile_grid": "centered-100",
             "current_time_ms": now,
-            "trigger": {"kind": "interval", "venue": None},
+            "trigger": {"kind": "time", "venue": None},
         },
         "venues": {
             "spot": _venue(
@@ -1188,6 +1186,23 @@ def load_payload(path: Path | None = None) -> dict:
     return payload_from_jsonable(json.loads(target.read_text(encoding="utf-8")))
 
 
+def _assert_time_order(times: Any, label: str) -> None:
+    arr = np.asarray(times)
+    if arr.size >= 2 and np.any(arr[1:] < arr[:-1]):
+        raise ValueError(label)
+
+
+def _assert_book_best_first(levels: Any, label: str, *, bids: bool) -> None:
+    book = np.asarray(levels)
+    if book.ndim != 2 or book.shape[0] < 2:
+        return
+    prices = book[:, 0]
+    if bids and np.any(prices[1:] > prices[:-1]):
+        raise ValueError(label)
+    if not bids and np.any(prices[1:] < prices[:-1]):
+        raise ValueError(label)
+
+
 def assert_payload_schema(payload: dict) -> None:
     """Fail if the payload does not match input.md schema_version 3."""
     if int(payload["schema_version"]) != SCHEMA_VERSION:
@@ -1204,8 +1219,15 @@ def assert_payload_schema(payload: dict) -> None:
         if key not in prompt:
             raise ValueError(f"prompt.{key}")
     trigger = prompt["trigger"] or {}
-    if trigger.get("kind") not in ("interval", "trade", "book"):
+    kind = trigger.get("kind")
+    if kind not in TRIGGER_KINDS:
         raise ValueError("prompt.trigger.kind")
+    venue = trigger.get("venue")
+    if kind == "time":
+        if venue is not None:
+            raise ValueError("prompt.trigger.venue")
+    elif venue not in TRIGGER_VENUES:
+        raise ValueError("prompt.trigger.venue")
     if int(prompt["horizon_seconds"]) != HORIZON_SECONDS:
         raise ValueError("prompt.horizon_seconds")
     if int(prompt["num_percentiles"]) != NUM_PERCENTILES:
@@ -1256,10 +1278,28 @@ def assert_payload_schema(payload: dict) -> None:
                     raise ValueError("futures.depth_updates.transaction_ts_ms")
             elif "transaction_ts_ms" in upd:
                 raise ValueError("spot.depth_updates must omit T")
-        last = venue.get("last_event_times") or {}
-        for stream in ("trade", "depth", "bookTicker", "kline_1s"):
-            if stream not in last:
+        last = venue.get("last_event_times")
+        if not isinstance(last, dict):
+            raise ValueError(f"{name}.last_event_times")
+        for stream, ts in last.items():
+            if isinstance(ts, bool) or not isinstance(ts, (int, np.integer)):
                 raise ValueError(f"{name}.last_event_times.{stream}")
+        _assert_time_order(candles["open_time_ms"], f"{name}.candles_1s.open_time_ms")
+        _assert_time_order(trades["recv_ts_ms"], f"{name}.trades.recv_ts_ms")
+        _assert_time_order(bt["recv_ts_ms"], f"{name}.book_ticker.recv_ts_ms")
+        if history_is_complete(candles["open_time_ms"]) != bool(candles["complete_history"]):
+            raise ValueError(f"{name}.candles_1s.complete_history")
+        n_tr = len(np.asarray(trades["ts_ms"]))
+        for key in ("event_ts_ms", "recv_ts_ms", "price", "qty", "buyer_is_maker"):
+            if len(np.asarray(trades[key])) != n_tr:
+                raise ValueError(f"{name}.trades.{key}")
+        n_bt = len(np.asarray(bt["recv_ts_ms"]))
+        for key in ("bid_price", "bid_qty", "ask_price", "ask_qty"):
+            if len(np.asarray(bt[key])) != n_bt:
+                raise ValueError(f"{name}.book_ticker.{key}")
+        for snap_name in ("depth_start", "depth_latest"):
+            _assert_book_best_first(venue[snap_name]["bids"], f"{name}.{snap_name}.bids", bids=True)
+            _assert_book_best_first(venue[snap_name]["asks"], f"{name}.{snap_name}.asks", bids=False)
 
 
 def write_sample_payload(path: Path | None = None, **kwargs: Any) -> Path:

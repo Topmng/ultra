@@ -13,10 +13,13 @@ CANDLE_WINDOW_S = 3600
 TRADE_WINDOW_S = 60
 BOOK_TICKER_WINDOW_S = 60
 SCHEMA_VERSION = 3
-# Spec: drop the score if the spot book-ticker feed is not live around the target.
+# input.md: prompt.trigger.kind. `venue` is None on a clock trigger.
+TRIGGER_KINDS = ("time", "event", "event_delayed")
+TRIGGER_VENUES = ("spot", "futures")
+# SPECIFICATION.md drops a prompt when the spot book is not live around the
+# target instant. The feed normally updates many times per second (FAQ.md),
+# so a gap longer than this means that instant has no live book.
 SPOT_FEED_LIVE_MS = 1000
-# REST bookTicker is "now"; allow a few seconds so inspect-after-10s still works.
-SPOT_FEED_REST_LIVE_MS = 5000
 
 
 def _norm_ppf(p: np.ndarray) -> np.ndarray:

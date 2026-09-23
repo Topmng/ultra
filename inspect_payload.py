@@ -128,12 +128,13 @@ def main(argv: list[str] | None = None) -> int:
         from synth_ultra.constants import HORIZON_SECONDS
 
         anchor = int(prompt["current_time_ms"])
-        y = realized_spot_microprice(anchor, allow_rest=True)
+        y = realized_spot_microprice(anchor, int(prompt.get("horizon_seconds", HORIZON_SECONDS)))
         if y is None:
             print(
-                f"\nCRPS skipped: no live spot book-ticker at current_time+{HORIZON_SECONDS}s. "
-                "Wait ~10s after capture and retry, or keep database/btc_spot_book_ticker.csv "
-                "covering that instant."
+                f"\nCRPS dropped: no spot book-ticker live at current_time+{HORIZON_SECONDS}s "
+                "(SPECIFICATION.md, no penalty). Scoring uses the last spot book-ticker "
+                "at or before that instant in database/btc_spot_book_ticker.csv. "
+                "REST bookTicker is only the current quote, so it is not the target price."
             )
         else:
             print(f"\nrealized_microprice={y:.4f}  CRPS={pinball_crps(out, y):.6f}")

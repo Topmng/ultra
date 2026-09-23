@@ -10,11 +10,13 @@ Payload streams in input.md vs what Binance actually publishes:
   candles_1s     spot 1s klines (Vision daily zip, REST for today)
                  futures 1s OHLCV rebuilt from aggTrades (fapi has no 1s kline)
   trades         spot + USDT-M aggTrades (Vision zip, REST fallback)
-  book_ticker    Vision tick dumps stopped ~Nov 2024; 1s series is filled from
-                 1s candles + REST spread, then a live REST snapshot is appended
-  depth          futures bookDepth (~30s % snapshots) replayed as 20-level books;
-                 spot books replayed from REST shape at 30s; diffs in jsonl
-                 (true L2 ticks still via --live-seconds)
+  book_ticker    Vision bookTicker when the daily zip exists, plus one REST snapshot.
+                 Candle closes are not a book. Recent days often 404; record
+                 the real stream with --live-seconds.
+  depth          one REST /depth snapshot (20 levels). bookDepth percent bins
+                 are a different product and are stored only in
+                 btc_futures_book_depth.csv. Diffs are the live depth@100ms
+                 stream (--live-seconds), not a snapshot replay.
 
 Writes under database/:
   btc_spot_candles.csv
@@ -63,9 +65,6 @@ HOURS = 48
 SECONDS_PER_HOUR = 3600
 LIMIT = 1000
 DEPTH_LIMIT = 20
-DEPTH_REPLAY_STEP_MS = 30_000
-SPARSE_BOOK_TICKER_ROWS = 3_600
-SPARSE_DEPTH_GROUPS = 3
 SPOT_KLINES_URL = "https://api.binance.com/api/v3/klines"
 SPOT_AGGTRADES_URL = "https://api.binance.com/api/v3/aggTrades"
 FUTURES_AGGTRADES_URL = "https://fapi.binance.com/fapi/v1/aggTrades"
@@ -232,6 +231,15 @@ def _to_ms(ts: int) -> int:
     if ts >= 10**15:
         return ts // 1000
     return ts
+
+
+def _looks_like_epoch_ms(value: str) -> bool:
+    """True for a Binance millisecond timestamp, not an order-book update id."""
+    try:
+        ms = _to_ms(int(float(value)))
+    except (TypeError, ValueError):
+        return False
+    return 1_483_228_800_000 <= ms <= 4_102_444_800_000
 
 
 def ms_to_utc(ms: int) -> str:
@@ -481,15 +489,20 @@ def fetch_aggtrades(
 
 
 def _parse_book_ticker_row(row: list[str], *, futures: bool) -> BookTicker | None:
-    if not row or not row[0].replace("-", "").isdigit():
+    """Vision bookTicker.
+
+    Futures: update_id, bid, bid_qty, ask, ask_qty, transaction_time, event_time.
+    Spot:    update_id, bid, bid_qty, ask, ask_qty, transaction_time.
+    Column 0 is an update id. The historical clock is transaction_time on spot
+    (the stream has no local receive time) and event_time on futures.
+    """
+    if not row or not row[0].replace("-", "").replace(".", "", 1).isdigit():
         return None
-    if futures and len(row) >= 7:
-        # update_id, bid_p, bid_q, ask_p, ask_q, transaction_time, event_time
+    if futures and len(row) >= 7 and _looks_like_epoch_ms(row[6]):
         event_ms = _to_ms(int(float(row[6])))
         tx_ms = _to_ms(int(float(row[5])))
-        recv = event_ms if event_ms else tx_ms
         return (
-            recv,
+            event_ms,
             float(row[1]),
             float(row[2]),
             float(row[3]),
@@ -498,7 +511,19 @@ def _parse_book_ticker_row(row: list[str], *, futures: bool) -> BookTicker | Non
             tx_ms,
             int(float(row[0])),
         )
-    if len(row) >= 5:
+    if not futures and len(row) >= 6 and _looks_like_epoch_ms(row[5]):
+        tx_ms = _to_ms(int(float(row[5])))
+        return (
+            tx_ms,
+            float(row[1]),
+            float(row[2]),
+            float(row[3]),
+            float(row[4]),
+            None,
+            None,
+            int(float(row[0])),
+        )
+    if len(row) >= 5 and _looks_like_epoch_ms(row[0]):
         recv = _to_ms(int(float(row[0])))
         return (
             recv,
@@ -918,6 +943,7 @@ def book_ticker_from_candle(
     *,
     futures: bool,
 ) -> dict[str, str | int | float]:
+    """Spread a candle close into a bid/ask pair. Not a Binance bookTicker row."""
     ts = int(float(candle["open_time_ms"]))
     close = float(candle["close"])
     bid = float(template["bid_price"])
@@ -1007,82 +1033,6 @@ def depth_rows_from_book(
             }
         )
     return rows
-
-
-def scale_depth_template(
-    template: list[dict[str, str | int | float]], ts: int, mid: float, *, futures: bool
-) -> list[dict[str, str | int | float]]:
-    bids = [(float(r["price"]), float(r["qty"])) for r in template if str(r["side"]).startswith("bid")]
-    asks = [(float(r["price"]), float(r["qty"])) for r in template if str(r["side"]).startswith("ask")]
-    if not bids or not asks:
-        return []
-    old_mid = 0.5 * (bids[0][0] + asks[0][0])
-    scale = mid / old_mid if old_mid else 1.0
-    bids = [(p * scale, q) for p, q in bids]
-    asks = [(p * scale, q) for p, q in asks]
-    uid = template[0]["update_id"] if template else ts
-    return depth_rows_from_book(ts, bids, asks, futures=futures, update_id=uid)
-
-
-def jsonl_last_ms(path: Path) -> int | None:
-    if not path.is_file() or path.stat().st_size == 0:
-        return None
-    with path.open("rb") as handle:
-        handle.seek(0, os.SEEK_END)
-        size = handle.tell()
-        handle.seek(max(0, size - 8192))
-        data = handle.read().decode("utf-8", errors="replace")
-    lines = [ln for ln in data.splitlines() if ln.strip()]
-    if not lines:
-        return None
-    try:
-        rec = json.loads(lines[-1])
-    except json.JSONDecodeError:
-        return None
-    ts = rec.get("recv_ts_ms")
-    return int(ts) if ts is not None else None
-
-
-def append_depth_updates_from_snapshots(
-    depth_path: Path, jsonl_path: Path, *, futures: bool, after_ms: int
-) -> int:
-    """Write one diff per new snapshot so payload depth_updates is non-empty."""
-    groups: dict[int, dict[str, list[list[float]]]] = {}
-    order: list[int] = []
-    if not depth_path.is_file():
-        return 0
-    with depth_path.open(newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            ts = int(row["recv_ts_ms"])
-            if ts <= after_ms:
-                continue
-            if ts not in groups:
-                groups[ts] = {"bids": [], "asks": []}
-                order.append(ts)
-            side = "bids" if str(row["side"]).startswith("bid") else "asks"
-            groups[ts][side].append([float(row["price"]), float(row["qty"])])
-    if len(order) < 2:
-        return 0
-    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    written = 0
-    with jsonl_path.open("a", encoding="utf-8") as handle:
-        prev_id = int(after_ms) if after_ms > 0 else int(order[0]) - 1
-        for ts in order:
-            rec: dict[str, Any] = {
-                "recv_ts_ms": ts,
-                "event_ts_ms": ts,
-                "first_id": prev_id + 1,
-                "final_id": ts,
-                "prev_final_id": prev_id,
-                "bids": groups[ts]["bids"],
-                "asks": groups[ts]["asks"],
-            }
-            if futures:
-                rec["transaction_ts_ms"] = ts
-            handle.write(json.dumps(rec) + "\n")
-            prev_id = ts
-            written += 1
-    return written
 
 
 def _print_candles(path: Path, candles: list[dict[str, str | int | float]]) -> None:
@@ -1294,45 +1244,18 @@ def _book_ticker_rows_from_zip(
     return rows
 
 
-def _longest_candles_csv(preferred: Path) -> Path:
-    """Prefer the candle file that extends furthest (spot is usually complete)."""
-    pref_last = csv_last_ms(preferred, "open_time_ms") or 0
-    spot_last = csv_last_ms(SPOT_CANDLES_CSV, "open_time_ms") or 0
-    if spot_last > pref_last + 1000 and SPOT_CANDLES_CSV.is_file():
-        return SPOT_CANDLES_CSV
-    return preferred
-
-
-def _fill_book_ticker_from_candles(
-    candles_path: Path,
-    start_ms: int,
-    end_ms: int,
-    template: dict[str, str | int | float],
-    *,
-    futures: bool,
-) -> list[dict[str, str | int | float]]:
-    out: list[dict[str, str | int | float]] = []
-    for candle in iter_csv_in_range(candles_path, "open_time_ms", start_ms, end_ms):
-        out.append(book_ticker_from_candle(candle, template, futures=futures))
-    last = int(out[-1]["recv_ts_ms"]) if out else start_ms - 1
-    if last < end_ms - 2000 and candles_path != SPOT_CANDLES_CSV:
-        for candle in iter_csv_in_range(SPOT_CANDLES_CSV, "open_time_ms", last + 1, end_ms):
-            out.append(book_ticker_from_candle(candle, template, futures=futures))
-    return out
-
-
 def fetch_book_ticker_series(start_ms: int, end_ms: int, *, futures: bool) -> int:
+    """Store real bookTicker rows only.
+
+    A candle close plus a copied spread is not the best bid/ask stream, and
+    scoring reads this file as the spot microprice. Vision is used when the
+    daily zip exists. One REST snapshot is a real quote at request time.
+    """
     path = FUTURES_BOOK_TICKER_CSV if futures else SPOT_BOOK_TICKER_CSV
     fields = FUTURES_BOOK_TICKER_FIELDS if futures else SPOT_BOOK_TICKER_FIELDS
-    candles_path = _longest_candles_csv(FUTURES_CANDLES_CSV if futures else SPOT_CANDLES_CSV)
     label = "USDT-M futures" if futures else "spot"
     zip_template = FUTURES_BOOK_TICKER_ZIP if futures else SPOT_BOOK_TICKER_ZIP
-    rebuild = csv_data_row_count(path) < SPARSE_BOOK_TICKER_ROWS
-    if rebuild and path.is_file():
-        path.unlink()
-        print(f"Rebuilding sparse {label} bookTicker from candles", flush=True)
-    template = rest_book_ticker_row(futures=futures)
-    print(f"Filling {label} bookTicker {ms_to_utc(start_ms)} -> {ms_to_utc(end_ms)}", flush=True)
+    print(f"Fetching {label} bookTicker {ms_to_utc(start_ms)} -> {ms_to_utc(end_ms)}", flush=True)
     rows: list[dict[str, str | int | float]] = []
     zipped = _book_ticker_rows_from_zip(
         zip_template, start_ms, end_ms, f"{label} bookTicker", futures=futures
@@ -1352,14 +1275,15 @@ def fetch_book_ticker_series(start_ms: int, end_ms: int, *, futures: bool) -> in
                 row["transaction_ts_ms"] = tx if tx is not None else ""
                 row["update_id"] = uid if uid is not None else ""
             rows.append(row)
-    filled = _fill_book_ticker_from_candles(
-        candles_path, start_ms, end_ms, template, futures=futures
-    )
-    print(f"  reconstructed {len(filled)} 1s bookTicker rows from candles", flush=True)
-    rows.extend(filled)
-    rows.append(template)
+    try:
+        rows.append(rest_book_ticker_row(futures=futures))
+    except (OSError, TimeoutError, RuntimeError, KeyError, TypeError, ValueError) as exc:
+        print(f"  {label} REST bookTicker snapshot failed: {exc}", flush=True)
     if not rows:
-        print(f"No {label} bookTicker rows.", file=sys.stderr)
+        print(
+            f"No {label} bookTicker rows. Record the live stream with --live-seconds.",
+            file=sys.stderr,
+        )
         return 1
     kept = ingest_rows(path, rows, fields, "recv_ts_ms", fill_gaps=True)
     print(f"Ingested {kept} {label} bookTicker rows into {path.resolve()}", flush=True)
@@ -1407,110 +1331,35 @@ def fetch_futures_book_depth(start_ms: int, end_ms: int) -> int:
     return 0
 
 
-def _depth_from_book_depth(start_ms: int, end_ms: int) -> list[dict[str, str | int | float]]:
-    if not FUTURES_BOOK_DEPTH_CSV.is_file():
-        return []
-    out: list[dict[str, str | int | float]] = []
-    current_ts: int | None = None
-    group: list[tuple[float, float, float]] = []
-
-    def flush() -> None:
-        if current_ts is None or not group:
-            return
-        bids, asks = percent_levels_to_book(group)
-        out.extend(depth_rows_from_book(current_ts, bids, asks, futures=True, update_id=current_ts))
-
-    for row in iter_csv_in_range(FUTURES_BOOK_DEPTH_CSV, "ts_ms", start_ms, end_ms):
-        ts = int(float(row["ts_ms"]))
-        item = (float(row["percentage"]), float(row["depth"]), float(row["notional"]))
-        if current_ts is None:
-            current_ts = ts
-        if ts != current_ts:
-            flush()
-            group = [item]
-            current_ts = ts
-        else:
-            group.append(item)
-    flush()
-    return out
-
-
-def _depth_from_candles(
-    candles_path: Path,
-    template: list[dict[str, str | int | float]],
-    start_ms: int,
-    end_ms: int,
-    *,
-    futures: bool,
-    step_ms: int = DEPTH_REPLAY_STEP_MS,
-) -> list[dict[str, str | int | float]]:
-    out: list[dict[str, str | int | float]] = []
-    last_written = start_ms - step_ms
-    last_candle: dict[str, str] | None = None
-    for candle in iter_csv_in_range(candles_path, "open_time_ms", start_ms, end_ms):
-        last_candle = candle
-        ts = int(float(candle["open_time_ms"]))
-        if ts - last_written < step_ms:
-            continue
-        out.extend(scale_depth_template(template, ts, float(candle["close"]), futures=futures))
-        last_written = ts
-    if last_candle is not None:
-        ts = int(float(last_candle["open_time_ms"]))
-        if not out or int(out[-1]["recv_ts_ms"]) != ts:
-            out.extend(scale_depth_template(template, ts, float(last_candle["close"]), futures=futures))
-    last = int(out[-1]["recv_ts_ms"]) if out else start_ms - 1
-    return out
-
-
 def fetch_depth_series(start_ms: int, end_ms: int, *, futures: bool) -> int:
+    """Store one real REST depth snapshot.
+
+    Replaying that shape onto old candle closes, or turning bookDepth percent
+    bins into prices, is not the order book in input.md. Incremental diffs
+    come from ``--live-seconds``. ``start_ms``/``end_ms`` bound the other
+    datasets; REST depth has no historical query.
+    """
+    del start_ms, end_ms
     path = FUTURES_DEPTH_CSV if futures else SPOT_DEPTH_CSV
-    candles_path = _longest_candles_csv(FUTURES_CANDLES_CSV if futures else SPOT_CANDLES_CSV)
-    jsonl_path = FUTURES_DEPTH_UPDATES_JSONL if futures else SPOT_DEPTH_UPDATES_JSONL
     label = "USDT-M futures" if futures else "spot"
     url = FUTURES_DEPTH_URL if futures else SPOT_DEPTH_URL
-    rebuild = csv_data_row_count(path) < SPARSE_DEPTH_GROUPS * 2 * DEPTH_LIMIT
     print(f"Fetching {SYMBOL} {label} REST depth ({DEPTH_LIMIT} levels)...")
     payload = _http_get_json(url, {"symbol": SYMBOL, "limit": DEPTH_LIMIT})
     live_rows = _depth_snapshot_rows(payload, futures=futures)
-    if rebuild and path.is_file():
-        path.unlink()
-        print(f"Rebuilding sparse {label} depth from historical books", flush=True)
-    if rebuild and jsonl_path.is_file():
-        jsonl_path.unlink()
-    rows: list[dict[str, str | int | float]] = []
-    if futures:
-        hist = _depth_from_book_depth(start_ms, end_ms)
-        if hist:
-            print(f"  {label} depth from bookDepth snapshots={len(hist) // (2 * DEPTH_LIMIT)}", flush=True)
-            rows.extend(hist)
-    filled = _depth_from_candles(candles_path, live_rows, start_ms, end_ms, futures=futures)
-    print(f"  {label} depth replayed from candles={len(filled) // max(2 * DEPTH_LIMIT, 1)}", flush=True)
-    rows.extend(filled)
-    if live_rows:
-        rows.extend(live_rows)
-    if not rows:
+    if not live_rows:
         print(f"No {label} depth returned.", file=sys.stderr)
         return 1
-    kept = ingest_rows(path, rows, DEPTH_SNAPSHOT_FIELDS, "recv_ts_ms", fill_gaps=True)
+    kept = ingest_rows(path, live_rows, DEPTH_SNAPSHOT_FIELDS, "recv_ts_ms")
     print(f"Ingested {kept} {label} depth rows into {path.resolve()}", flush=True)
-    n_upd = 0
-    if rows:
-        after = jsonl_last_ms(jsonl_path)
-        if after is None:
-            after = min(int(r["recv_ts_ms"]) for r in rows) - 1
-        n_upd = append_depth_updates_from_snapshots(
-            path, jsonl_path, futures=futures, after_ms=after
-        )
-    print(f"Appended {n_upd} {label} depth_updates to {jsonl_path.resolve()}", flush=True)
-    if live_rows:
-        best_bid = next(r for r in live_rows if r["side"] == "bid" and r["level"] == 0)
-        best_ask = next(r for r in live_rows if r["side"] == "ask" and r["level"] == 0)
-        print(
-            f"  live snapshot recv={live_rows[0]['recv_ts_utc']}  "
-            f"bid={best_bid['price']} x {best_bid['qty']}  "
-            f"ask={best_ask['price']} x {best_ask['qty']}",
-            flush=True,
-        )
+    best_bid = next(r for r in live_rows if r["side"] == "bid" and r["level"] == 0)
+    best_ask = next(r for r in live_rows if r["side"] == "ask" and r["level"] == 0)
+    print(
+        f"  live snapshot recv={live_rows[0]['recv_ts_utc']}  "
+        f"bid={best_bid['price']} x {best_bid['qty']}  "
+        f"ask={best_ask['price']} x {best_ask['qty']}",
+        flush=True,
+    )
+    print(f"  {label} depth_updates are recorded only by --live-seconds", flush=True)
     return 0
 
 
@@ -1686,6 +1535,7 @@ def _handle_ws_payload(
     bt_writers: dict[str, csv.DictWriter],
     depth_files: dict[str, TextIO],
     counts: dict[str, int],
+    prev_ids: dict[str, int | None],
 ) -> None:
     name = stream.split("@", 1)[-1] if stream else ""
     is_book = (
@@ -1716,7 +1566,11 @@ def _handle_ws_payload(
             "event_ts_ms": int(data["E"]) if data.get("E") is not None else recv_ms,
             "first_id": int(data["U"]),
             "final_id": int(data["u"]),
-            "prev_final_id": int(data["pu"]) if data.get("pu") is not None else int(data["U"]) - 1,
+            "prev_final_id": (
+                int(data["pu"])
+                if data.get("pu") is not None
+                else (prev_ids[venue] if prev_ids.get(venue) is not None else int(data["U"]) - 1)
+            ),
             "bids": [[float(p), float(q)] for p, q in data.get("b") or []],
             "asks": [[float(p), float(q)] for p, q in data.get("a") or []],
         }
@@ -1724,6 +1578,7 @@ def _handle_ws_payload(
             rec["transaction_ts_ms"] = int(data["T"])
         depth_files[venue].write(json.dumps(rec) + "\n")
         counts[f"{venue}-depth"] += 1
+        prev_ids[venue] = int(data["u"])
 
 
 def record_live_streams(seconds: float) -> int:
@@ -1753,6 +1608,7 @@ def record_live_streams(seconds: float) -> int:
     depth_files["spot"] = SPOT_DEPTH_UPDATES_JSONL.open("a", encoding="utf-8")
     depth_files["futures"] = FUTURES_DEPTH_UPDATES_JSONL.open("a", encoding="utf-8")
     counts = {"spot-book": 0, "futures-book": 0, "spot-depth": 0, "futures-depth": 0}
+    prev_ids: dict[str, int | None] = {"spot": None, "futures": None}
     deadline = time.time() + seconds
     last_snap = time.time()
     try:
@@ -1787,7 +1643,9 @@ def record_live_streams(seconds: float) -> int:
                 msg = json.loads(text)
                 data = msg.get("data") if isinstance(msg.get("data"), dict) else msg
                 stream = str(msg.get("stream") or "")
-                _handle_ws_payload(venue, stream, data, recv_ms, bt_writers, depth_files, counts)
+                _handle_ws_payload(
+                    venue, stream, data, recv_ms, bt_writers, depth_files, counts, prev_ids
+                )
             if sum(counts.values()) and sum(counts.values()) % 5000 < 8:
                 print(
                     f"  live  spot_bt={counts['spot-book']} fut_bt={counts['futures-book']} "

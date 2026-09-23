@@ -17,7 +17,7 @@ from synth_ultra.payload import (
     make_sample_payload,
     payload_to_jsonable,
 )
-from synth_ultra.scoring import pinball_crps, realized_spot_microprice, spot_microprice
+from synth_ultra.scoring import pinball_crps, prompt_field_scores, realized_spot_microprice, spot_microprice
 from synth_ultra.validate import backtest_anchors, check_output, run_once, validate
 
 
@@ -131,6 +131,24 @@ def test_crps_perfect_forecast_is_low():
     assert pinball_crps(x, y) < 1e-6
 
 
+def test_crps_matches_spec_formula():
+    y = 10.0
+    x = np.full(100, 11.0, dtype=np.float64)
+    # u = -1, rho = 1 - tau, sum(tau) = 50, CRPS = (2/100) * 50 = 1
+    assert pinball_crps(x, y) == pytest.approx(1.0)
+
+
+def test_prompt_field_scores_match_faq():
+    raw = np.array([1.0, 2.0, 3.0, 4.0, 0.0])
+    answered = np.array([True, True, True, True, False])
+    adjusted = prompt_field_scores(raw, answered)
+    assert adjusted is not None
+    penalty = float(np.quantile(raw[:4], 0.95))
+    assert adjusted[-1] == pytest.approx(penalty - 1.0)
+    assert adjusted[0] == pytest.approx(0.0)
+    assert prompt_field_scores(raw, np.zeros(5, dtype=bool)) is None
+
+
 def test_microprice_formula():
     assert spot_microprice(100.0, 1.0, 102.0, 3.0) == pytest.approx(100.5)
 
@@ -147,13 +165,17 @@ def test_backtest_anchors_match_example_window():
 
 def test_validate_report_keys():
     t = default_current_time_ms() - 10_000
-    report = validate(warmup=2, rounds=8, seed=0, strict=False, current_time_ms=t)
+    report = validate(warmup=1, rounds=2, seed=0, strict=False, current_time_ms=t, time_length=1)
     assert report["ok"] is True
     assert "median_ms" in report
     assert report["budget_ms"] == 5.0
-    assert report["crps"] is not None
-    assert report["realized_price"] > 0
-    assert report["n_scored"] >= 1
+    assert report["n"] == 1
+    if report["crps"] is None:
+        assert report["n_dropped"] == 1
+        assert report["n_scored"] == 0
+    else:
+        assert report["realized_price"] > 0
+        assert report["n_scored"] == 1
 
 
 def test_compact_json_payload_is_predictable():
@@ -171,14 +193,41 @@ def test_synthetic_sample_matches_input_md():
     assert_payload_schema(payload)
     spot = payload["venues"]["spot"]
     fut = payload["venues"]["futures"]
-    assert spot["candles_1s"]["complete_history"] is True
+    assert spot["candles_1s"]["complete_history"] is False
     assert fut["candles_1s"]["complete_history"] is False
+    assert payload["prompt"]["trigger"] == {"kind": "time", "venue": None}
     assert spot["depth_latest"]["bids"].shape == (20, 2)
     assert fut["depth_latest"]["asks"].shape == (20, 2)
     assert "transaction_ts_ms" not in spot["depth_updates"][0]
     assert "transaction_ts_ms" in fut["depth_updates"][0]
     assert int(spot["last_event_times"]["trade"]) == int(spot["trades"]["recv_ts_ms"][-1])
     assert int(fut["last_event_times"]["bookTicker"]) == int(fut["book_ticker"]["recv_ts_ms"][-1])
+
+
+def test_full_synthetic_hour_flags():
+    payload = make_sample_payload(0, compact=False, synthetic=True, current_time_ms=1_700_000_000_000)
+    assert_payload_schema(payload)
+    spot = payload["venues"]["spot"]["candles_1s"]
+    fut = payload["venues"]["futures"]["candles_1s"]
+    assert spot["complete_history"] is True
+    assert spot["ohlcv"].shape[0] >= CANDLE_WINDOW_S
+    assert fut["complete_history"] is False
+    assert fut["ohlcv"].shape[0] < spot["ohlcv"].shape[0]
+    assert payload["prompt"]["trigger"]["kind"] == "time"
+
+
+def test_trigger_kinds():
+    payload = make_sample_payload(0, compact=True, synthetic=True, current_time_ms=1_700_000_000_000)
+    payload["prompt"]["trigger"] = {"kind": "event", "venue": "spot"}
+    assert_payload_schema(payload)
+    payload["prompt"]["trigger"] = {"kind": "event_delayed", "venue": "futures"}
+    assert_payload_schema(payload)
+    payload["prompt"]["trigger"] = {"kind": "interval", "venue": None}
+    with pytest.raises(ValueError):
+        assert_payload_schema(payload)
+    payload["prompt"]["trigger"] = {"kind": "time", "venue": "spot"}
+    with pytest.raises(ValueError):
+        assert_payload_schema(payload)
 
 
 def test_sample_payload_json_roundtrip():
