@@ -1,82 +1,208 @@
 """BTC 10s percentile forecast. Target: <5 ms, CPU-only, deterministic.
 
-Laplace location-scale ladder with Cornish-Fisher skew, coefficients fit to
-minimize pinball CRPS on saved database pairs. Never-raise fallback so a
-non-answer is not charged under FAQ.md.
+Price-space Laplace jump-mixture (core + heavy tails) with location/scale
+linear in enriched book/trade features. Coefficients fit to minimize pinball
+CRPS on saved database pairs. Never-raise fallback so a non-answer is not
+charged under FAQ.md.
 """
 
 from __future__ import annotations
 
+import gc
+
 import numpy as np
 
-from synth_ultra.constants import HORIZON_SECONDS, LAPLACE_Z, NUM_PERCENTILES
+from synth_ultra.constants import HORIZON_SECONDS, NUM_PERCENTILES
 from synth_ultra.features import extract
 
 _EPS = 1e-12
 _MIN_PRICE = 1e-8
-_MIN_SIGMA = 2e-5
-_MAX_SIGMA = 2e-2
+_MIN_SIGMA_PX = 0.5
+_MAX_SIGMA_PX = 800.0
 
 # CRPS-tuned coeffs (saved-pair fit). See feature order in _mu_vec / _abs_vec.
 _B_MU = np.array(
     [
-        0.1621919418405019,
-        2.3087496491810143e-05,
-        1.229369687682148e-05,
-        0.17545516716617593,
-        -0.057379035335046284,
-        -0.04259338416892133,
-        0.1443709676053327,
-        -3.2008585305186402e-06,
-        -1.9592192261792666e-05,
-        5.0426006039934125e-06,
-        9.575090331414568e-06,
-        1.229295582578837e-05,
-        -8.295260715008355e-06,
-        0.012820538129957629,
-        -2.572950899550816,
-        8.016922705093469e-05,
-        0.22254131953857567,
-        -0.09424357096906136,
-        0.06611336142142803,
-        -0.06323465974250335,
+        0.16219725476591365,
+        3.0392548397260206e-05,
+        1.2921967376416503e-05,
+        0.17545357593694502,
+        -0.057379556931711054,
+        -0.042592960514635785,
+        0.14437278080879343,
+        -5.040059876530939e-06,
+        -2.9598223746399192e-05,
+        8.80503231208016e-07,
+        6.543536873659752e-06,
+        3.819089008691624e-05,
+        -3.851394849050198e-05,
+        0.012819614731266383,
+        -2.5729505064060203,
+        7.80781830077767e-05,
+        0.2225417214564695,
+        -0.09424387369323395,
+        0.06611178032601009,
+        -0.06323517171109437,
+        1.3194603589745686e-05,
+        9.25776900504624e-06,
+        6.419523696500204e-06,
+        9.704432289751613e-06,
+        -7.61375359503243e-05,
+        8.219239603035196e-09,
     ],
     dtype=np.float64,
 )
 _B_ABS = np.array(
     [
-        0.3112795455044023,
-        -0.046124149923485416,
-        -0.27015317939963984,
-        0.05338272789119308,
-        -0.10630187950653455,
-        0.0419512533220603,
-        0.4830032497381303,
-        0.14988666656143482,
-        0.05522215787942206,
-        0.287906734773655,
-        -0.21714497223880505,
-        1.9651266320709486e-05,
-        -1.046717418160122e-05,
-        2.5430565877878673e-05,
-        -3.602539570706466,
-        -0.00012844804630290628,
-        0.00012784684025356208,
-        0.00016267855991521185,
-        0.018053123447344804,
-        -0.5633128002994777,
-        -0.09328297099808118,
-        0.11197699497939505,
-        -0.19790132877227598,
-        0.34658171714722014,
+        0.31128035091375017,
+        -0.04612335008069495,
+        -0.27015375057439384,
+        0.05338090769963195,
+        -0.10630344326911181,
+        0.04195075214608767,
+        0.48300301336701507,
+        0.14988622199220886,
+        0.05522149798895418,
+        0.28790522175963235,
+        -0.2171458492361658,
+        7.440005212080741e-06,
+        1.5006480516698034e-05,
+        5.258077361233235e-06,
+        -3.602539619772853,
+        -2.7531539341820717e-05,
+        0.00029563500111100656,
+        7.860095041094238e-05,
+        0.018052856090945528,
+        -0.5633117688000335,
+        -0.09328221925825791,
+        0.11197666410197983,
+        -0.19790213408961582,
+        0.3465817220321161,
+        -5.886429731585097e-08,
+        -1.194041355427959e-06,
+        1.1416268283201004e-06,
+        1.3031647192685995e-06,
+        -5.381035088350931e-07,
+        -0.0004201840209259798,
+        -1.4343343808409522e-05,
     ],
     dtype=np.float64,
 )
-_KA = 0.74
-_KB = 0.17
-_FL = 3e-6
-_SH = 1.42
-_G0 = 0.97
+_KA = 0.75
+_KB = 0.20
+_FL = 5e-5
+_SH = 1.20
+_FR = 0.15
+_FV = 0.05
+_SM = 0.90
+
+# Standardized quantiles of (1-w)*Laplace(0,1) + w*Laplace(0,r), w=0.15, r=3.
+# Precomputed so inference stays numpy-only (no scipy in the miner image).
+_MIX_Z = np.array(
+    [
+        -8.195296766019496,
+        -5.290455382749503,
+        -4.189473492373635,
+        -3.558928761226856,
+        -3.130018036741951,
+        -2.809478451891556,
+        -2.5554904666449834,
+        -2.3461068991409015,
+        -2.1685150645304785,
+        -2.014637822514757,
+        -1.879079631466685,
+        -1.7580695625741907,
+        -1.6488748569423617,
+        -1.5494554430067913,
+        -1.4582502010738922,
+        -1.3740392432906956,
+        -1.2958520713528672,
+        -1.2229045008325568,
+        -1.1545542250063079,
+        -1.0902688057552605,
+        -1.0296021595823457,
+        -0.9721769807684978,
+        -0.9176713964804792,
+        -0.865808692117394,
+        -0.8163492998117764,
+        -0.7690844793903884,
+        -0.7238312817274705,
+        -0.6804284955014599,
+        -0.6387333564233322,
+        -0.5986188536579183,
+        -0.559971508386832,
+        -0.5226895288992309,
+        -0.48668126838854353,
+        -0.4518639279418573,
+        -0.4181624595326374,
+        -0.3855086332303556,
+        -0.3538402400763217,
+        -0.3231004076881543,
+        -0.29323701004778674,
+        -0.26420215637718525,
+        -0.2359517467597128,
+        -0.2084450843380587,
+        -0.1816445356867318,
+        -0.15551523237167816,
+        -0.1300248078599066,
+        -0.10514316488530429,
+        -0.0808422691479815,
+        -0.05709596585577331,
+        -0.03387981614877673,
+        -0.01117095088164434,
+        0.01117095088164428,
+        0.03387981614877675,
+        0.05709596585577319,
+        0.08084226914798152,
+        0.10514316488530434,
+        0.13002480785990664,
+        0.1555152323716778,
+        0.18164453568673153,
+        0.20844508433805856,
+        0.23595174675971262,
+        0.26420215637718536,
+        0.29323701004778674,
+        0.323100407688154,
+        0.3538402400763216,
+        0.38550863323035545,
+        0.41816245953263753,
+        0.45186392794185726,
+        0.48668126838854336,
+        0.5226895288992306,
+        0.5599715083868319,
+        0.5986188536579181,
+        0.6387333564233322,
+        0.6804284955014599,
+        0.7238312817274708,
+        0.7690844793903882,
+        0.8163492998117761,
+        0.8658086921173938,
+        0.9176713964804795,
+        0.9721769807684977,
+        1.029602159582346,
+        1.0902688057552605,
+        1.1545542250063072,
+        1.2229045008325565,
+        1.2958520713528667,
+        1.374039243290695,
+        1.458250201073892,
+        1.5494554430067913,
+        1.6488748569423621,
+        1.758069562574191,
+        1.8790796314666847,
+        2.0146378225147576,
+        2.1685150645304794,
+        2.346106899140902,
+        2.5554904666449842,
+        2.8094784518915548,
+        3.130018036741951,
+        3.558928761226851,
+        4.189473492373635,
+        5.290455382749499,
+        8.195296766019453,
+    ],
+    dtype=np.float64,
+)
 
 
 def _sanitize(x: np.ndarray) -> np.ndarray:
@@ -90,17 +216,15 @@ def _sanitize(x: np.ndarray) -> np.ndarray:
     return out
 
 
-def _ladder(px: float, mu: float, sigma: float, skew: float = 0.0) -> np.ndarray:
-    """Log-Laplace percentiles with optional Cornish-Fisher skew."""
-    z = LAPLACE_Z
-    if abs(skew) > 1e-12:
-        z = z + (skew / 6.0) * (z * z - 1.0)
-    log_px = np.log(max(float(px), _MIN_PRICE))
-    out = np.exp(log_px + float(mu) + float(sigma) * z, dtype=np.float64)
+def _ladder(px: float, mu_px: float, sigma_px: float) -> np.ndarray:
+    """Price-space mixture percentiles: px + mu + sigma * mix_z(tau)."""
+    out = float(px) + float(mu_px) + float(sigma_px) * _MIX_Z
     return _sanitize(out)
 
 
-def _mu_vec(f: dict[str, float]) -> np.ndarray:
+def _mu_vec(f: dict[str, float], vol10: float) -> np.ndarray:
+    imb = 0.5 * (f["s_imb"] + f["f_imb"])
+    flow = 0.5 * (f["flow_fast"] + f["f_flow2"])
     return np.array(
         [
             f["basis"],
@@ -123,14 +247,21 @@ def _mu_vec(f: dict[str, float]) -> np.ndarray:
             f["s_m3"],
             f["f_m3"],
             f["c3"],
+            imb,
+            flow,
+            imb * vol10,
+            flow * vol10,
+            np.tanh(f["c1"] * 3000.0),
+            f["basis"] * vol10,
         ],
         dtype=np.float64,
     )
 
 
-def _abs_vec(f: dict[str, float]) -> np.ndarray:
-    vol10 = f["vol_1s"] * np.sqrt(float(HORIZON_SECONDS))
-    vol_fast10 = f["vol_fast"] * np.sqrt(float(HORIZON_SECONDS))
+def _abs_vec(f: dict[str, float], vol10: float, vol_fast10: float) -> np.ndarray:
+    rng = max(f["s_rng"], f["f_rng"])
+    rv = max(f["s_rv"], f["f_rv"])
+    log_fqty = np.log1p(max(f["f_qty2"], 0.0)) / 10.0
     return np.array(
         [
             vol10,
@@ -149,7 +280,7 @@ def _abs_vec(f: dict[str, float]) -> np.ndarray:
             abs(f["flow_fast"]),
             f["spread_rel"],
             np.log1p(max(f["s_qty2"], 0.0)) / 10.0,
-            np.log1p(max(f["f_qty2"], 0.0)) / 10.0,
+            log_fqty,
             1.0,
             f["c1"],
             abs(f["c1"]),
@@ -157,6 +288,13 @@ def _abs_vec(f: dict[str, float]) -> np.ndarray:
             abs(f["s_m3"]),
             abs(f["f_m3"]),
             abs(f["c3"]),
+            rng,
+            rv,
+            max(vol10, vol_fast10),
+            max(rng - vol10, 0.0),
+            log_fqty * rng,
+            f["stale_ms"] / 1000.0,
+            1.0 if f["stale_ms"] > 250.0 else 0.0,
         ],
         dtype=np.float64,
     )
@@ -174,34 +312,44 @@ def predict_percentiles(payload: dict) -> np.ndarray:
     try:
         f = extract(payload)
         px = max(f["price"], _MIN_PRICE)
+        vol10 = f["vol_1s"] * np.sqrt(float(HORIZON_SECONDS))
+        vol_fast10 = f["vol_fast"] * np.sqrt(float(HORIZON_SECONDS))
+        rng = max(f["s_rng"], f["f_rng"])
+        rv = max(f["s_rv"], f["f_rv"])
 
-        mu = float(np.dot(_B_MU, _mu_vec(f)) * _SH)
-        pred_abs = max(float(np.dot(_B_ABS, _abs_vec(f))), 0.0)
-        sigma = float(np.clip(_KA * pred_abs + _KB * abs(mu) + _FL, _MIN_SIGMA, _MAX_SIGMA))
-        if f["stale_ms"] > 250.0:
-            sigma *= 1.0 + min(f["stale_ms"] / 1000.0, 1.0)
-            sigma = float(np.clip(sigma, _MIN_SIGMA, _MAX_SIGMA))
-        mu = float(np.clip(mu, -5.0 * sigma, 5.0 * sigma))
-        skew = float(_G0 * np.tanh(mu / max(sigma, 1e-12)))
-        return _ladder(px, mu, sigma, skew)
+        mu_ret = float(np.dot(_B_MU, _mu_vec(f, vol10)) * _SH)
+        pred_abs = max(float(np.dot(_B_ABS, _abs_vec(f, vol10, vol_fast10))), 0.0)
+        # Location/scale in price units (CRPS is dollar-denominated).
+        mu_px = mu_ret * px
+        sigma_px = (_KA * pred_abs + _KB * abs(mu_ret) + _FL) * px
+        sigma_px = max(sigma_px, (_FR * rng + _FV * rv) * px)
+        sigma_px = float(np.clip(sigma_px * _SM, _MIN_SIGMA_PX, _MAX_SIGMA_PX))
+        mu_px = float(np.clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px))
+        return _ladder(px, mu_px, sigma_px)
     except Exception:
         px = _MIN_PRICE
         try:
             venues = (payload or {}).get("venues") or {}
             spot = venues.get("spot") or {}
             book = spot.get("book_ticker") or {}
-            bid = np.asarray(book.get("bid_price", []), dtype=np.float64)
-            ask = np.asarray(book.get("ask_price", []), dtype=np.float64)
-            if bid.size and ask.size and np.isfinite(bid[-1]) and np.isfinite(ask[-1]):
-                px = max(0.5 * (float(bid[-1]) + float(ask[-1])), _MIN_PRICE)
-            else:
+            bid = book.get("bid_price")
+            ask = book.get("ask_price")
+            if bid is not None and ask is not None and len(bid) and len(ask):
+                bp = float(bid[-1] if not isinstance(bid, np.ndarray) else bid.reshape(-1)[-1])
+                ap = float(ask[-1] if not isinstance(ask, np.ndarray) else ask.reshape(-1)[-1])
+                if np.isfinite(bp) and np.isfinite(ap):
+                    px = max(0.5 * (bp + ap), _MIN_PRICE)
+            if px <= _MIN_PRICE:
                 candles = spot.get("candles_1s") or {}
-                ohlcv = np.asarray(candles.get("ohlcv", []), dtype=np.float64)
-                if ohlcv.ndim == 2 and ohlcv.shape[0] and ohlcv.shape[1] >= 4:
-                    px = max(float(ohlcv[-1, 3]), _MIN_PRICE)
+                ohlcv = candles.get("ohlcv")
+                if ohlcv is not None:
+                    arr = ohlcv if isinstance(ohlcv, np.ndarray) else np.asarray(ohlcv, dtype=np.float64)
+                    if arr.ndim == 2 and arr.shape[0] and arr.shape[1] >= 4:
+                        px = max(float(arr[-1, 3]), _MIN_PRICE)
         except Exception:
             px = _MIN_PRICE
-        return _ladder(px, 0.0, _MIN_SIGMA, 0.0)
+        # Wide mixture fallback so a degraded path is not overconfident.
+        return _ladder(px, 0.0, max(8.0, 1e-4 * px))
 
 
 def _import_warmup() -> None:
@@ -213,6 +361,9 @@ def _import_warmup() -> None:
             "venues": {"spot": {}, "futures": {}},
         }
     )
+    # Automatic GC pauses are a common source of multi-ms latency spikes.
+    gc.collect()
+    gc.disable()
 
 
 _import_warmup()

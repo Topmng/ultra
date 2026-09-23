@@ -35,15 +35,36 @@ def microprice(bid_p: float, bid_q: float, ask_p: float, ask_q: float) -> float:
     return (bid_p * ask_q + ask_p * bid_q) / den
 
 
+def _last_f64(x: Any, default: float = 0.0) -> float:
+    """Last element only — avoids materializing a full book-ticker column."""
+    if x is None:
+        return default
+    if isinstance(x, np.ndarray):
+        if x.size == 0:
+            return default
+        return float(x.reshape(-1)[-1])
+    try:
+        n = len(x)  # type: ignore[arg-type]
+    except TypeError:
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return default
+    if n == 0:
+        return default
+    return float(x[n - 1])  # type: ignore[index]
+
+
 def last_book_micro(book_ticker: dict | None) -> tuple[float, float, float]:
     """Return (microprice, mid, spread) from the latest book-ticker row."""
     if not book_ticker:
         return 0.0, 0.0, 0.0
-    bid_p = _as_f64(book_ticker.get("bid_price"))
-    bid_q = _as_f64(book_ticker.get("bid_qty"))
-    ask_p = _as_f64(book_ticker.get("ask_price"))
-    ask_q = _as_f64(book_ticker.get("ask_qty"))
-    bp, bq, ap, aq = bid_p[-1], bid_q[-1], ask_p[-1], ask_q[-1]
+    bp = _last_f64(book_ticker.get("bid_price"))
+    bq = _last_f64(book_ticker.get("bid_qty"))
+    ap = _last_f64(book_ticker.get("ask_price"))
+    aq = _last_f64(book_ticker.get("ask_qty"))
+    if bp <= 0.0 and ap <= 0.0:
+        return 0.0, 0.0, 0.0
     mid = 0.5 * (bp + ap)
     spread = max(ap - bp, 0.0)
     return microprice(bp, bq, ap, aq), mid, spread
@@ -82,23 +103,30 @@ def top_imbalance(snapshot: dict | None, n: int = 5) -> float:
 def trade_imbalance(trades: dict | None, last_n: int | None = None) -> float:
     if not trades:
         return 0.0
-    qty = _as_f64(trades.get("qty"))
-    maker = _as_bool(trades.get("buyer_is_maker"))
-    if qty.size == 0 or maker.size == 0:
+    qty = trades.get("qty")
+    maker = trades.get("buyer_is_maker")
+    if qty is None or maker is None:
         return 0.0
-    n = min(qty.size, maker.size)
+    if isinstance(qty, np.ndarray):
+        q = qty.reshape(-1)
+    else:
+        q = np.asarray(qty, dtype=np.float64).reshape(-1)
+    if isinstance(maker, np.ndarray):
+        mk = maker.reshape(-1)
+    else:
+        mk = np.asarray(maker, dtype=bool).reshape(-1)
+    n = min(q.size, mk.size)
+    if n == 0:
+        return 0.0
     if last_n is not None:
         n = min(n, last_n)
-        qty = qty[-n:]
-        maker = maker[-n:]
-    else:
-        qty = qty[-n:]
-        maker = maker[-n:]
-    signed = np.where(maker, -qty, qty)
-    tot = float(np.sum(qty))
+    q = q[-n:]
+    mk = mk[-n:]
+    tot = float(np.sum(q))
     if tot <= 0.0:
         return 0.0
-    return float(np.sum(signed) / tot)
+    signed = float(np.sum(np.where(mk, -q, q)))
+    return signed / tot
 
 
 def trade_flow_window(trades: dict | None, window_ms: int = 2000) -> tuple[float, float]:
@@ -135,11 +163,22 @@ def log_returns(close: np.ndarray) -> np.ndarray:
     return np.diff(np.log(close))
 
 
+# Cached EWMA weights for the candle lengths we actually use (avoids alloc per call).
+_EWMA_W94_120 = (1.0 - 0.94) * (0.94 ** np.arange(119, -1, -1, dtype=np.float64))
+_EWMA_W94_120 /= _EWMA_W94_120.sum()
+_EWMA_W85_90 = (1.0 - 0.85) * (0.85 ** np.arange(89, -1, -1, dtype=np.float64))
+_EWMA_W85_90 /= _EWMA_W85_90.sum()
+
+
 def ewma_vol(returns: np.ndarray, lam: float = 0.94) -> float:
     if returns.size == 0:
         return 0.0
     r2 = returns * returns
     n = r2.size
+    if lam == 0.94 and n == _EWMA_W94_120.size:
+        return float(np.sqrt(np.dot(_EWMA_W94_120, r2)))
+    if lam == 0.85 and n == _EWMA_W85_90.size:
+        return float(np.sqrt(np.dot(_EWMA_W85_90, r2)))
     w = (1.0 - lam) * lam ** np.arange(n - 1, -1, -1, dtype=np.float64)
     w /= w.sum()
     return float(np.sqrt(np.dot(w, r2)))
@@ -149,28 +188,63 @@ def candle_close(venue: dict | None) -> np.ndarray:
     if not venue:
         return np.empty(0, dtype=np.float64)
     candles = venue.get("candles_1s") or {}
-    ohlcv = np.asarray(candles.get("ohlcv", []), dtype=np.float64)
-    if ohlcv.ndim != 2 or ohlcv.shape[0] == 0 or ohlcv.shape[1] < 4:
+    ohlcv = candles.get("ohlcv")
+    if ohlcv is None:
         return np.empty(0, dtype=np.float64)
-    return ohlcv[:, 3]
+    arr = ohlcv if isinstance(ohlcv, np.ndarray) else np.asarray(ohlcv, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] < 4:
+        return np.empty(0, dtype=np.float64)
+    return arr[:, 3]
+
+
+def _close_tail(venue: dict | None, n: int) -> np.ndarray:
+    """Last ``n`` closes only — skips scanning the full hour of candles."""
+    if not venue:
+        return np.empty(0, dtype=np.float64)
+    candles = venue.get("candles_1s") or {}
+    ohlcv = candles.get("ohlcv")
+    if ohlcv is None:
+        return np.empty(0, dtype=np.float64)
+    arr = ohlcv if isinstance(ohlcv, np.ndarray) else np.asarray(ohlcv, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] < 4:
+        return np.empty(0, dtype=np.float64)
+    return np.asarray(arr[-n:, 3], dtype=np.float64)
 
 
 def venue_vol_and_momentum(venue: dict | None) -> tuple[float, float]:
     """1s EWMA vol and last-horizon log return. Falls back to zeros."""
-    close = candle_close(venue)
-    rets = log_returns(close)
+    # Need HORIZON+1 for momentum and 121 closes for 120 returns.
+    close = _close_tail(venue, max(HORIZON_SECONDS + 1, 121))
+    if close.size < 2:
+        return 0.0, 0.0
+    # Trust candle closes; avoid a full finite-mask copy on the hot path.
+    rets = np.diff(np.log(np.maximum(close[-(121):], 1e-12)))
     vol_1s = ewma_vol(rets[-120:] if rets.size else rets)
     if close.size > HORIZON_SECONDS:
-        c0 = close[-(HORIZON_SECONDS + 1)]
-        c1 = close[-1]
+        c0 = float(close[-(HORIZON_SECONDS + 1)])
+        c1 = float(close[-1])
         mom = float(np.log(c1 / c0)) if c0 > 0.0 and c1 > 0.0 else 0.0
     else:
         mom = 0.0
     return vol_1s, mom
 
 
+def _col_tail(arr: Any, n: int, i0: int) -> np.ndarray:
+    """Aligned ``arr[-n:][i0:]`` view/copy as float64."""
+    if isinstance(arr, np.ndarray):
+        a = arr.reshape(-1)[-n:]
+        sl = a[i0:]
+        return sl if sl.dtype == np.float64 else np.asarray(sl, dtype=np.float64)
+    a = np.asarray(arr, dtype=np.float64).reshape(-1)[-n:]
+    return a[i0:]
+
+
 def book_ticker_stats(book_ticker: dict | None, lookback_ms: int = 12_000) -> dict[str, float]:
-    """Microprice momentum, range, and realized vol from recent book ticker."""
+    """Microprice momentum, range, and realized vol from recent book ticker.
+
+    Avoids building a full microprice series on busy 10k–60k-tick windows
+    (FAQ.md): only timestamps are scanned, then a few indexed microprices.
+    """
     out = {
         "imb": 0.0,
         "m1": 0.0,
@@ -181,46 +255,74 @@ def book_ticker_stats(book_ticker: dict | None, lookback_ms: int = 12_000) -> di
     }
     if not book_ticker:
         return out
-    bp = _as_f64(book_ticker.get("bid_price"))
-    bq = _as_f64(book_ticker.get("bid_qty"))
-    ap = _as_f64(book_ticker.get("ask_price"))
-    aq = _as_f64(book_ticker.get("ask_qty"))
-    ts = np.asarray(book_ticker.get("recv_ts_ms", []), dtype=np.int64)
-    n = min(bp.size, bq.size, ap.size, aq.size, ts.size)
+    ts_raw = book_ticker.get("recv_ts_ms")
+    bp_raw = book_ticker.get("bid_price")
+    bq_raw = book_ticker.get("bid_qty")
+    ap_raw = book_ticker.get("ask_price")
+    aq_raw = book_ticker.get("ask_qty")
+    if ts_raw is None or bp_raw is None or bq_raw is None or ap_raw is None or aq_raw is None:
+        return out
+    ts_all = ts_raw if isinstance(ts_raw, np.ndarray) else np.asarray(ts_raw, dtype=np.int64)
+    if ts_all.size == 0:
+        return out
+    n = min(ts_all.size, len(bp_raw), len(bq_raw), len(ap_raw), len(aq_raw))
     if n == 0:
         return out
-    bp, bq, ap, aq, ts = bp[-n:], bq[-n:], ap[-n:], aq[-n:], ts[-n:]
-    now = int(ts[-1])
-    i0 = int(np.searchsorted(ts, now - lookback_ms, side="right"))
-    bp, bq, ap, aq, ts = bp[i0:], bq[i0:], ap[i0:], aq[i0:], ts[i0:]
-    if bp.size == 0:
+    ts_all = ts_all.reshape(-1)[-n:]
+    now = int(ts_all[-1])
+    i0 = int(np.searchsorted(ts_all, now - lookback_ms, side="right"))
+    # Restrict columns to the lookback window only.
+    bp = _col_tail(bp_raw, n, i0)
+    bq = _col_tail(bq_raw, n, i0)
+    ap = _col_tail(ap_raw, n, i0)
+    aq = _col_tail(aq_raw, n, i0)
+    ts = ts_all[i0:]
+    m = ts.size
+    if m == 0:
         return out
-    micro = (bp * aq + ap * bq) / np.maximum(bq + aq, 1e-12)
-    imb = (bq - aq) / np.maximum(bq + aq, 1e-12)
-    out["imb"] = float(imb[-1])
+
+    def _micro(i: int) -> float:
+        den = float(bq[i]) + float(aq[i])
+        if den <= 0.0:
+            return 0.5 * (float(bp[i]) + float(ap[i]))
+        return (float(bp[i]) * float(aq[i]) + float(ap[i]) * float(bq[i])) / den
+
+    last = m - 1
+    den_last = float(bq[last]) + float(aq[last])
+    out["imb"] = (
+        (float(bq[last]) - float(aq[last])) / den_last if den_last > 0.0 else 0.0
+    )
+    micro_last = _micro(last)
 
     def _mom(ms: int) -> float:
         i = int(np.searchsorted(ts, now - ms, side="right") - 1)
         if i < 0:
             return 0.0
-        a, b = float(micro[i]), float(micro[-1])
-        if a <= 0.0 or b <= 0.0:
+        a = _micro(i)
+        if a <= 0.0 or micro_last <= 0.0:
             return 0.0
-        return float(np.log(b / a))
+        return float(np.log(micro_last / a))
 
     out["m1"] = _mom(1000)
     out["m3"] = _mom(3000)
     out["m5"] = _mom(5000)
 
     i10 = int(np.searchsorted(ts, now - 10_000, side="right"))
-    window = micro[i10:]
-    if window.size > 5:
-        rets = np.diff(np.log(np.maximum(window, 1e-12)))
-        out["rv"] = float(np.std(rets) * np.sqrt(max(rets.size, 1)))
-        lo = float(np.min(window))
-        hi = float(np.max(window))
-        if lo > 0.0:
-            out["rng"] = float(np.log(hi / lo))
+    # At most ~512 microprices for rv/rng, evenly spaced in the 10s window.
+    span = m - i10
+    if span > 5:
+        n_samp = min(span, 512)
+        idxs = i10 + np.linspace(0, span - 1, n_samp, dtype=np.int64)
+        den = bq[idxs] + aq[idxs]
+        samples = (bp[idxs] * aq[idxs] + ap[idxs] * bq[idxs]) / np.maximum(den, 1e-12)
+        samples = samples[samples > 0.0]
+        if samples.size > 5:
+            rets = np.diff(np.log(samples))
+            out["rv"] = float(np.std(rets) * np.sqrt(max(rets.size, 1)))
+            lo = float(np.min(samples))
+            hi = float(np.max(samples))
+            if lo > 0.0:
+                out["rng"] = float(np.log(hi / lo))
     return out
 
 
@@ -269,9 +371,12 @@ def extract(payload: dict) -> dict[str, float]:
     else:
         fut_vol, fut_mom = spot_vol, spot_mom
 
-    close = candle_close(spot)
-    rets = log_returns(close)
-    vol_fast = ewma_vol(rets[-90:], lam=0.85) if rets.size else spot_vol
+    close = _close_tail(spot, max(HORIZON_SECONDS + 1, 121))
+    if close.size >= 2:
+        rets_fast = np.diff(np.log(np.maximum(close[-91:], 1e-12)))
+        vol_fast = ewma_vol(rets_fast[-90:], lam=0.85) if rets_fast.size else spot_vol
+    else:
+        vol_fast = spot_vol
     c1 = 0.0
     c3 = 0.0
     if close.size >= 2 and close[-2] > 0.0:
@@ -282,18 +387,18 @@ def extract(payload: dict) -> dict[str, float]:
     vol_1s = 0.6 * spot_vol + 0.4 * fut_vol if fut_vol > 0.0 else spot_vol
     mom = 0.5 * spot_mom + 0.5 * fut_mom
 
-    obi = 0.5 * depth_imbalance(spot.get("depth_latest")) + 0.5 * depth_imbalance(
-        fut.get("depth_latest")
+    spot_depth = spot.get("depth_latest")
+    fut_depth = fut.get("depth_latest")
+    obi = 0.5 * depth_imbalance(spot_depth) + 0.5 * depth_imbalance(fut_depth)
+    top_obi = 0.5 * top_imbalance(spot_depth) + 0.5 * top_imbalance(fut_depth)
+    spot_trades = spot.get("trades")
+    fut_trades = fut.get("trades")
+    flow = 0.5 * trade_imbalance(spot_trades) + 0.5 * trade_imbalance(fut_trades)
+    flow_fast = 0.5 * trade_imbalance(spot_trades, last_n=50) + 0.5 * trade_imbalance(
+        fut_trades, last_n=50
     )
-    top_obi = 0.5 * top_imbalance(spot.get("depth_latest")) + 0.5 * top_imbalance(
-        fut.get("depth_latest")
-    )
-    flow = 0.5 * trade_imbalance(spot.get("trades")) + 0.5 * trade_imbalance(fut.get("trades"))
-    flow_fast = 0.5 * trade_imbalance(spot.get("trades"), last_n=50) + 0.5 * trade_imbalance(
-        fut.get("trades"), last_n=50
-    )
-    s_flow2, s_qty2 = trade_flow_window(spot.get("trades"), 2000)
-    f_flow2, f_qty2 = trade_flow_window(fut.get("trades"), 2000)
+    s_flow2, s_qty2 = trade_flow_window(spot_trades, 2000)
+    f_flow2, f_qty2 = trade_flow_window(fut_trades, 2000)
 
     s_bt = book_ticker_stats(spot.get("book_ticker"))
     f_bt = book_ticker_stats(fut.get("book_ticker"))
