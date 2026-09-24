@@ -27,7 +27,7 @@ from synth_ultra.constants import (
 )
 from synth_ultra.model import predict_percentiles
 from synth_ultra.payload import load_payload, make_sample_payload, preload_venue_csvs
-from synth_ultra.saved_pairs import iter_pairs, load_book
+from synth_ultra.saved_pairs import BookReadError, iter_pairs, load_book
 from synth_ultra.scoring import pinball_crps, realized_from_saved_book, realized_spot_microprice
 
 PLOT_DIR = Path("plot")
@@ -399,9 +399,15 @@ def validate_saved_pairs(
     reports: list[dict[str, Any]] = []
     all_times: list[float] = []
     asset = "BTC"
+    n_unreadable = 0
     for i, (_folder, payload_file, book_file) in enumerate(pairs, start=1):
         payload = load_payload(payload_file)
-        book = load_book(book_file)
+        try:
+            book = load_book(book_file)
+        except BookReadError as exc:
+            n_unreadable += 1
+            print(f"skip test {i}  {_folder.name}  {exc}", flush=True)
+            continue
         asset = str(payload["prompt"].get("asset") or asset)
         anchor = int(payload["prompt"]["current_time_ms"])
         horizon = int(payload["prompt"].get("horizon_seconds", HORIZON_SECONDS))
@@ -413,7 +419,7 @@ def validate_saved_pairs(
         one = _validate_one(
             payload,
             rounds=rounds,
-            warmup=warmup if i == 1 else 0,
+            warmup=warmup if len(reports) == 0 else 0,
             realized_price=realized,
         )
         one["elapsed_s"] = time.perf_counter() - t1
@@ -422,6 +428,10 @@ def validate_saved_pairs(
         all_times.extend(one["predict_times_s"])
         if on_test is not None:
             on_test(i, one)
+
+    if not reports:
+        detail = f"; {n_unreadable} unreadable" if n_unreadable else ""
+        raise ValidationError(f"no readable payload/book pairs under {database}{detail}")
 
     median = statistics.median(all_times)
     p95 = statistics.quantiles(all_times, n=20)[18] if len(all_times) >= 20 else max(all_times)
@@ -435,6 +445,7 @@ def validate_saved_pairs(
         "n": len(reports),
         "n_scored": len(scored),
         "n_dropped": len(reports) - len(scored),
+        "n_unreadable": n_unreadable,
         "time_interval": 0,
         "time_length": len(reports),
         "median_ms": median * 1000.0,

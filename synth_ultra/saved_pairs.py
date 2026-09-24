@@ -35,5 +35,15 @@ def iter_pairs(database: Path):
             yield folder, payload, book
 
 
+class BookReadError(ValueError):
+    """A saved spot-book file is missing, empty, or not a JSON object."""
+
+
 def load_book(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise BookReadError(f"unreadable book {path}: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise BookReadError(f"unreadable book {path}: expected a JSON object")
+    return doc

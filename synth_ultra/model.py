@@ -1,9 +1,10 @@
 """BTC 10s percentile forecast. Target: <5 ms, CPU-only, deterministic.
 
-Price-space Laplace jump-mixture (core + heavy tails) with location/scale
-linear in enriched book/trade features. Coefficients fit to minimize pinball
-CRPS on saved database pairs. Never-raise fallback so a non-answer is not
-charged under FAQ.md.
+Price-space Laplace jump-mixture (core + heavy tails). Location is linear in
+book and trade features. Scale starts from that fit, then widens toward the
+mean absolute 10-second move in the payload's own candle history whenever the
+fit is tighter than the market just was. Never-raise fallback so a non-answer
+is not charged under FAQ.md.
 """
 
 from __future__ import annotations
@@ -203,6 +204,9 @@ _MIX_Z = np.array(
     ],
     dtype=np.float64,
 )
+# Mean absolute deviation of the mixture quantile grid. A price scale of `s`
+# then has the same mean absolute deviation as `s * _MIX_Z`.
+_Z_ABS = float(np.mean(np.abs(_MIX_Z)))
 
 
 def _sanitize(x: np.ndarray) -> np.ndarray:
@@ -214,6 +218,48 @@ def _sanitize(x: np.ndarray) -> np.ndarray:
     if np.any(diffs <= 0.0):
         out[1:] += np.cumsum(np.where(diffs <= 0.0, _EPS, 0.0))
     return out
+
+
+def _realized_mix_scale(close: np.ndarray, px: float) -> float:
+    """Mixture scale whose mean absolute deviation matches recent 10s moves.
+
+    Uses whatever candle history the payload actually carries, so the floor
+    tracks the current regime instead of a fixed volatility constant.
+    """
+    if close.size < 40:
+        return 0.0
+    c = np.maximum(np.asarray(close, dtype=np.float64), 1e-12)
+    step = int(HORIZON_SECONDS)
+    moved = np.log(c[step:] / c[:-step])
+    if moved.size < 30:
+        return 0.0
+    mean_abs = float(np.mean(np.abs(moved - np.median(moved))))
+    if mean_abs <= 0.0 or not np.isfinite(mean_abs):
+        return 0.0
+    return float(px) * mean_abs / _Z_ABS
+
+
+def _spot_closes(payload: dict) -> np.ndarray:
+    ohlcv = (((payload.get("venues") or {}).get("spot") or {}).get("candles_1s") or {}).get("ohlcv")
+    if ohlcv is None:
+        return np.empty(0, dtype=np.float64)
+    arr = ohlcv if isinstance(ohlcv, np.ndarray) else np.asarray(ohlcv, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] < 4:
+        return np.empty(0, dtype=np.float64)
+    return arr[:, 3]
+
+
+def _blend_scale(fitted: float, realized: float) -> float:
+    """Raise a too-tight fitted scale toward the realized-move scale.
+
+    When the fitted scale is already wider, keep it: live bursts should be
+    able to fatten the distribution immediately. The 0.8 power closes most of
+    the gap and is the holdout minimum between 'ignore the hour' and 'replace
+    the fitted scale outright'.
+    """
+    if not np.isfinite(realized) or realized <= fitted or fitted <= 0.0:
+        return fitted
+    return float(fitted * (realized / fitted) ** 0.8)
 
 
 def _ladder(px: float, mu_px: float, sigma_px: float) -> np.ndarray:
@@ -324,6 +370,8 @@ def predict_percentiles(payload: dict) -> np.ndarray:
         sigma_px = (_KA * pred_abs + _KB * abs(mu_ret) + _FL) * px
         sigma_px = max(sigma_px, (_FR * rng + _FV * rv) * px)
         sigma_px = float(np.clip(sigma_px * _SM, _MIN_SIGMA_PX, _MAX_SIGMA_PX))
+        sigma_px = _blend_scale(sigma_px, _realized_mix_scale(_spot_closes(payload), px))
+        sigma_px = float(np.clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX))
         mu_px = float(np.clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px))
         return _ladder(px, mu_px, sigma_px)
     except Exception:

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from synth_ultra.payload import load_payload
-from synth_ultra.saved_pairs import book_path
+from synth_ultra.saved_pairs import BookReadError, book_path
 from synth_ultra.scoring import realized_from_saved_book
 from synth_ultra.validate import (
     ValidationError,
@@ -112,18 +112,22 @@ def main(argv: list[str] | None = None) -> int:
                 strict=args.strict,
                 on_test=_print_one,
             )
-    except ValidationError as exc:
+    except (ValidationError, BookReadError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
 
     print()
     dropped = int(report.get("n_dropped") or 0)
     scored = int(report.get("n_scored") or 0)
+    unreadable = int(report.get("n_unreadable") or 0)
     if report["crps"] is None:
-        print(f"average CRPS=dropped  scored=0  dropped={dropped}")
+        extra = f"  unreadable={unreadable}" if unreadable else ""
+        print(f"average CRPS=dropped  scored=0  dropped={dropped}{extra}")
         print(f"maximum predict time={report['max_ms']:.3f} ms")
     else:
         extra = f"  scored={scored}  dropped={dropped}" if dropped else ""
+        if unreadable:
+            extra += f"  unreadable={unreadable}"
         print(f"average CRPS={report['crps']:.6f}{extra}")
         print(f"maximum predict time={report['max_ms']:.3f} ms")
     crps_path = crps_csv_path(str(report["asset"]))

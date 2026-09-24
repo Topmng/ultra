@@ -95,6 +95,40 @@ def test_validate_saved_pairs_uses_book_file(tmp_path):
     assert report["reports"][0]["book_recv_ts_ms"] == anchor + 10_000
 
 
+def test_nul_book_is_skipped(tmp_path):
+    anchor = 1_700_000_000_000
+    good = tmp_path / str(anchor)
+    payload = make_sample_payload(
+        seed=1, current_time_ms=anchor, synthetic=True, compact=True
+    )
+    save_payload(payload, payload_path(good))
+    book_path(good).write_text(
+        json.dumps(
+            {
+                "current_time_ms": anchor,
+                "target_ms": anchor + 10_000,
+                "recv_ts_ms": anchor + 10_000,
+                "bid_price": 100.0,
+                "bid_qty": 1.0,
+                "ask_price": 100.4,
+                "ask_qty": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    bad_anchor = anchor + 20_000
+    bad = tmp_path / str(bad_anchor)
+    bad_payload = make_sample_payload(
+        seed=2, current_time_ms=bad_anchor, synthetic=True, compact=True
+    )
+    save_payload(bad_payload, payload_path(bad))
+    book_path(bad).write_bytes(b"\x00" * 225)
+    report = validate_saved_pairs(tmp_path, warmup=0, rounds=1)
+    assert report["n"] == 1
+    assert report["n_unreadable"] == 1
+    assert report["n_scored"] == 1
+
+
 def test_stale_saved_book_is_dropped(tmp_path):
     anchor = 1_700_000_000_000
     folder = tmp_path / str(anchor)
