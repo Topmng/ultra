@@ -62,22 +62,6 @@ def spot_microprice_at(times_ms: np.ndarray, bid_price, bid_qty, ask_price, ask_
     return spot_microprice(bp, bq, ap, aq)
 
 
-def _spot_microprice_from_csv(target_ms: int) -> float | None:
-    from synth_ultra.payload import SPOT_BOOK_TICKER_CSV, _load_book_ticker_csv
-
-    table = _load_book_ticker_csv(str(SPOT_BOOK_TICKER_CSV))
-    if table is None or table["recv_ts_ms"].size == 0:
-        return None
-    return spot_microprice_at(
-        table["recv_ts_ms"],
-        table["bid_price"],
-        table["bid_qty"],
-        table["ask_price"],
-        table["ask_qty"],
-        target_ms,
-    )
-
-
 def realized_from_saved_book(
     row: dict,
     current_time_ms: int,
@@ -103,21 +87,6 @@ def realized_from_saved_book(
     if not _finite_positive_book(bp, bq, ap, aq):
         return None
     return spot_microprice(bp, bq, ap, aq)
-
-
-def realized_spot_microprice(
-    current_time_ms: int,
-    horizon_seconds: int = HORIZON_SECONDS,
-) -> float | None:
-    """Spot book-ticker microprice at ``current_time_ms + horizon``.
-
-    SPECIFICATION.md: the last spot book-ticker update at or before the target
-    instant. Returns None (prediction dropped, no penalty) when that feed is
-    not live. Binance REST bookTicker is only the current quote and has no
-    historical timestamp, so it is not a substitute for the book at the target.
-    """
-    target = int(current_time_ms) + int(horizon_seconds) * 1000
-    return _spot_microprice_from_csv(target)
 
 
 def pinball_crps(percentiles: np.ndarray, realized_price: float) -> float:

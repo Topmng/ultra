@@ -1,10 +1,10 @@
 """BTC 10s percentile forecast. Target: <5 ms, CPU-only, deterministic.
 
 Price-space Laplace jump-mixture (core + heavy tails). Location is linear in
-book and trade features. Scale starts from that fit, then widens toward the
-mean absolute 10-second move in the payload's own candle history whenever the
-fit is tighter than the market just was. Never-raise fallback so a non-answer
-is not charged under FAQ.md.
+book and trade features. The 100 percentiles are the centered quantiles of that
+mixture. Scale follows predicted 10-second volatility: a feature fit blended
+with recent absolute moves, so quiet regimes tighten and active regimes widen.
+Never-raise fallback so a non-answer is not charged under FAQ.md.
 """
 
 from __future__ import annotations
@@ -249,6 +249,50 @@ def _spot_closes(payload: dict) -> np.ndarray:
     return arr[:, 3]
 
 
+# Log-blend of the fitted mixture scale with short-horizon 10s volatility.
+# Weights minimize pinball CRPS on the saved pairs. Fast realized vol can
+# both widen and tighten the 100-quantile ladder; the hour-average floor cannot.
+_VOL_W = np.array([0.7199761, 0.18929481, 0.06551382, 0.02521527], dtype=np.float64)
+_VOL_LOG_BIAS = 0.04421702415367945
+
+
+def _ewma_abs(abs_r: np.ndarray, lam: float = 0.98) -> float:
+    n = abs_r.size
+    if n == 0:
+        return 0.0
+    w = (1.0 - lam) * lam ** np.arange(n - 1, -1, -1, dtype=np.float64)
+    w /= w.sum()
+    return float(np.dot(w, abs_r))
+
+
+def _vol_aware_scale(fitted: float, close: np.ndarray, px: float) -> float:
+    """Set mixture scale from fitted vol and recent 10s move size.
+
+    The 100 percentiles are the centered quantiles of a Laplace jump-mixture
+    located at the predicted price. Width tracks a blend of the feature-based
+    scale, the EWMA of recent 10-second absolute moves, 60-second realized
+    vol, and the last 10-second high-low range.
+    """
+    if close.size < 40 or not np.isfinite(fitted) or fitted <= 0.0:
+        return fitted
+    c = np.maximum(np.asarray(close, dtype=np.float64), 1e-12)
+    moved = np.abs(np.log(c[10:] / c[:-10]))
+    if moved.size < 30:
+        return fitted
+    fast = float(px) * _ewma_abs(moved) / _Z_ABS
+    if c.size >= 61:
+        rets = np.diff(np.log(c[-61:]))
+        rv60 = float(px) * float(np.std(rets) * np.sqrt(10.0)) / _Z_ABS
+    else:
+        rv60 = fast
+    sl = c[-10:]
+    lo = float(np.min(sl))
+    hi = float(np.max(sl))
+    hl10 = float(px) * float(np.log(hi / lo)) / _Z_ABS if lo > 0.0 and hi > lo else fast
+    vals = np.maximum(np.array([fitted, fast, rv60, hl10], dtype=np.float64), 0.3)
+    return float(np.exp(np.dot(_VOL_W, np.log(vals)) + _VOL_LOG_BIAS))
+
+
 def _blend_scale(fitted: float, realized: float) -> float:
     """Raise a too-tight fitted scale toward the realized-move scale.
 
@@ -370,7 +414,9 @@ def predict_percentiles(payload: dict) -> np.ndarray:
         sigma_px = (_KA * pred_abs + _KB * abs(mu_ret) + _FL) * px
         sigma_px = max(sigma_px, (_FR * rng + _FV * rv) * px)
         sigma_px = float(np.clip(sigma_px * _SM, _MIN_SIGMA_PX, _MAX_SIGMA_PX))
-        sigma_px = _blend_scale(sigma_px, _realized_mix_scale(_spot_closes(payload), px))
+        closes = _spot_closes(payload)
+        sigma_px = _blend_scale(sigma_px, _realized_mix_scale(closes, px))
+        sigma_px = _vol_aware_scale(sigma_px, closes, px)
         sigma_px = float(np.clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX))
         mu_px = float(np.clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px))
         return _ladder(px, mu_px, sigma_px)

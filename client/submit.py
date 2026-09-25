@@ -1,23 +1,38 @@
 #!/usr/bin/env python3
-"""Synth Ultra submission client.
+"""Synth Ultra onboarding + submission client.
 
-Signs the sr25519 submission envelope with your subnet hotkey and posts your
-pre-pushed image reference to the submission API. The server verifies the exact
-message `vhft-submission|v1|{hotkey}|{unix_ts}|{payload_hash}`, where
-payload_hash = sha256 over the canonical JSON of {image_uri, image_digest, version}.
+Everything is signed with your subnet hotkey (sr25519). Your hotkey IS your identity —
+there is no account, no password, and no email round-trip. Each action signs a different
+message, so a signature for one can never be replayed as another:
 
-You need `bittensor` available. The simplest way, with no install, is uv:
+  credentials  vhft-onboard-status|v1|{hotkey}|{unix_ts}
+  submit       vhft-submission|v1|{hotkey}|{unix_ts}|{payload_hash}
+  status       vhft-status|v1|{hotkey}|{unix_ts}
 
-  # submit (use YOUR wallet + hotkey, YOUR registry repo from onboarding, and the
-  # digest that `docker push` printed):
+where payload_hash = sha256 over the canonical JSON of the payload.
+
+You need `bittensor` available. The simplest way, with no install, is uv.
+
+THE ORDER, once end to end:
+
+  # 1. ask Synth to register your hotkey (see ONBOARDING.md).
+
+  # 2. once we tell you that you are set up, collect your push key. This writes
+  #    the key to a file and prints the docker login line. You get TWO retrievals
+  #    in total, so keep the file.
+  uv run --no-project --with "bittensor>=11,<12" python submit.py credentials \
+    --wallet my_coldkey --hotkey my_hotkey
+
+  # 3. build + push your image to the repo the previous step printed, then submit
+  #    the digest that `docker push` gave you:
   uv run --no-project --with "bittensor>=11,<12" python submit.py submit \
-    --wallet bt --hotkey live2 \
-    --image-uri asia-northeast1-docker.pkg.dev/synth-vhft/vhft-henry-bauer/miner \
-    --image-digest sha256:YOUR_64_HEX_DIGEST_FROM_DOCKER_PUSH --version 1
+    --wallet my_coldkey --hotkey my_hotkey \
+    --image-uri <your-registry-repo>/miner \
+    --image-digest sha256:<digest-from-docker-push> --version 1
 
-  # check status (signature-gated):
+  # check submission status any time (signature-gated):
   uv run --no-project --with "bittensor>=11,<12" python submit.py status \
-    --wallet bt --hotkey live2
+    --wallet my_coldkey --hotkey my_hotkey
 
 Identity options:
   --wallet <name> --hotkey <hk>   reads ~/.bittensor/wallets/<name>/hotkeys/<hk>

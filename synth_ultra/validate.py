@@ -26,9 +26,9 @@ from synth_ultra.constants import (
     QUANTILE_GRID,
 )
 from synth_ultra.model import predict_percentiles
-from synth_ultra.payload import load_payload, make_sample_payload, preload_venue_csvs
+from synth_ultra.payload import load_payload, make_sample_payload
 from synth_ultra.saved_pairs import BookReadError, iter_pairs, load_book
-from synth_ultra.scoring import pinball_crps, realized_from_saved_book, realized_spot_microprice
+from synth_ultra.scoring import pinball_crps, realized_from_saved_book
 
 PLOT_DIR = Path("plot")
 CRPS_DIR = Path("crps")
@@ -239,10 +239,7 @@ def _validate_one(
     target = anchor + horizon * 1000
     # SPECIFICATION.md: drop (no penalty) when the spot book is not live at the
     # target. FAQ.md: the container's one warm-up call is not scored or timed.
-    if realized_price is _LOOKUP_REALIZED:
-        realized = realized_spot_microprice(anchor, horizon)
-    else:
-        realized = realized_price
+    realized = None if realized_price is _LOOKUP_REALIZED else realized_price
     for _ in range(max(0, warmup)):
         predict_percentiles(payload)
     for _ in range(rounds):
@@ -288,18 +285,17 @@ def validate(
     time_interval: int = 1,
     time_length: int = 1,
     payload: dict | None = None,
+    realized_price: Any = _LOOKUP_REALIZED,
     on_test: Callable[[int, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     t_prep = time.perf_counter()
-    if payload is None:
-        preload_venue_csvs()
     prepare_s = time.perf_counter() - t_prep
     if on_test is not None:
         print(f"prepare={prepare_s:.3f} s")
         sys.stdout.flush()
     if payload is not None:
         t1 = time.perf_counter()
-        one = _validate_one(payload, rounds=rounds, warmup=warmup)
+        one = _validate_one(payload, rounds=rounds, warmup=warmup, realized_price=realized_price)
         one["elapsed_s"] = time.perf_counter() - t1
         if on_test is not None:
             on_test(1, one)
@@ -320,10 +316,15 @@ def validate(
         asset = "BTC"
         for i, anchor in enumerate(anchors, start=1):
             t1 = time.perf_counter()
-            point_payload = make_sample_payload(seed, current_time_ms=anchor, fill_missing=False)
+            point_payload = make_sample_payload(seed, current_time_ms=anchor)
             if i == 1:
                 asset = str(point_payload["prompt"]["asset"])
-            one = _validate_one(point_payload, rounds=rounds, warmup=warmup if i == 1 else 0)
+            one = _validate_one(
+                point_payload,
+                rounds=rounds,
+                warmup=warmup if i == 1 else 0,
+                realized_price=realized_price,
+            )
             one["elapsed_s"] = time.perf_counter() - t1
             reports.append(one)
             all_times.extend(one["predict_times_s"])
