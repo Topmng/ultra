@@ -339,6 +339,79 @@ def _as_int_scalar(v: Any) -> int | None:
         return None
 
 
+def liquidation_signals(liquidations: dict | None, now_ms: int) -> tuple[float, float]:
+    """Signed 10s pressure and 1h activity from futures liquidations.
+
+    ``is_buy`` is the liquidation order's side, not the trapped position.
+    True means the exchange is buying to close a short, which pushes price up.
+    Returns ``(direction, hour_activity)``, each in ``[-1, 1]`` and ``[0, 1]``.
+    """
+    if not liquidations or int(now_ms) <= 0:
+        return 0.0, 0.0
+    recv = np.asarray(liquidations.get("recv_ts_ms"), dtype=np.int64).reshape(-1)
+    qty = np.asarray(liquidations.get("qty"), dtype=np.float64).reshape(-1)
+    buy = np.asarray(liquidations.get("is_buy"), dtype=bool).reshape(-1)
+    n = min(recv.size, qty.size, buy.size)
+    if n == 0:
+        return 0.0, 0.0
+    recv = recv[-n:]
+    qty = qty[-n:]
+    buy = buy[-n:]
+    now = int(now_ms)
+    hour = (recv >= now - 3_600_000) & (recv <= now) & np.isfinite(qty) & (qty > 0.0)
+    if not np.any(hour):
+        return 0.0, 0.0
+    q = qty[hour]
+    side = np.where(buy[hour], 1.0, -1.0)
+    recent = recv[hour] >= now - 10_000
+    signed = float(np.sum(side[recent] * q[recent])) if np.any(recent) else 0.0
+    return float(np.tanh(signed / 0.25)), float(np.tanh(float(np.sum(q)) / 1.0))
+
+
+def depth_band_imbalance(
+    bands: dict | None,
+    mid: float,
+    now_ms: int,
+    reach_usd: float = 200.0,
+) -> float:
+    """Order-book imbalance from spot depth bands, re-anchored to the live mid.
+
+    Band 0 is around ``anchor_price`` at snapshot time, not around the current
+    price. A ``recv_ts_ms`` of 0, or a snapshot older than 90s, is unused.
+    """
+    if not bands or mid <= 0.0:
+        return 0.0
+    recv = int(bands.get("recv_ts_ms") or 0)
+    if recv <= 0:
+        return 0.0
+    if int(now_ms) > 0 and int(now_ms) - recv > 90_000:
+        return 0.0
+    anchor = float(bands.get("anchor_price") or 0.0)
+    bucket = float(bands.get("bucket_usd") or 0.0)
+    if anchor <= 0.0 or bucket <= 0.0 or not np.isfinite(anchor):
+        return 0.0
+    bids = np.asarray(bands.get("bids"), dtype=np.float64).reshape(-1)
+    asks = np.asarray(bands.get("asks"), dtype=np.float64).reshape(-1)
+    if bids.size == 0 and asks.size == 0:
+        return 0.0
+    bid_sz = 0.0
+    if bids.size:
+        idx = np.arange(bids.size, dtype=np.float64)
+        bid_lo = anchor - (idx + 1.0) * bucket
+        bid_hi = anchor - idx * bucket
+        bid_sz = float(bids[(bid_hi > mid - reach_usd) & (bid_lo < mid)].sum())
+    ask_sz = 0.0
+    if asks.size:
+        idx = np.arange(asks.size, dtype=np.float64)
+        ask_lo = anchor + idx * bucket
+        ask_hi = anchor + (idx + 1.0) * bucket
+        ask_sz = float(asks[(ask_lo < mid + reach_usd) & (ask_hi > mid)].sum())
+    tot = bid_sz + ask_sz
+    if tot <= 0.0 or not np.isfinite(tot):
+        return 0.0
+    return (bid_sz - ask_sz) / tot
+
+
 def last_event_age_ms(venue: dict | None, now_ms: int) -> float:
     if not venue:
         return 0.0
@@ -407,6 +480,10 @@ def extract(payload: dict) -> dict[str, float]:
     if px <= 0.0:
         px = float(close[-1]) if close.size else 1.0
 
+    ref = spot_mid if spot_mid > 0.0 else px
+    band_imb = depth_band_imbalance(spot.get("depth_bands"), ref, now_ms)
+    liq_dir, liq_hour = liquidation_signals(fut.get("liquidations"), now_ms)
+
     basis = 0.0
     if spot_micro > 0.0 and fut_micro > 0.0:
         basis = (fut_micro - spot_micro) / spot_micro
@@ -447,4 +524,7 @@ def extract(payload: dict) -> dict[str, float]:
         "stale_ms": float(stale_ms),
         "spot_complete": float(spot_complete),
         "fut_complete": float(fut_complete),
+        "liq_dir": float(liq_dir),
+        "liq_hour": float(liq_hour),
+        "band_imb": float(band_imb),
     }

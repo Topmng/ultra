@@ -1,4 +1,4 @@
-"""Shape-faithful sample payload for local validation (input.md schema_version 3)."""
+"""Shape-faithful sample payload for local validation (input.md schema_version 5)."""
 
 from __future__ import annotations
 
@@ -11,8 +11,11 @@ import numpy as np
 from synth_ultra.constants import (
     BOOK_TICKER_WINDOW_S,
     CANDLE_WINDOW_S,
+    DEPTH_BAND_USD,
+    DEPTH_BANDS,
     DEPTH_LEVELS,
     HORIZON_SECONDS,
+    LIQUIDATION_WINDOW_S,
     NUM_PERCENTILES,
     SCHEMA_VERSION,
     TRADE_WINDOW_S,
@@ -64,6 +67,78 @@ def history_is_complete(open_time_ms: np.ndarray) -> bool:
     if times.size < CANDLE_WINDOW_S:
         return False
     return int(times[-1]) - int(times[0]) >= (CANDLE_WINDOW_S - 1) * 1000
+
+
+def empty_liquidations() -> dict:
+    """Futures-only stream. Spot is present and always empty (input.md)."""
+    return {
+        "ts_ms": np.array([], dtype=np.int64),
+        "recv_ts_ms": np.array([], dtype=np.int64),
+        "price": np.array([], dtype=np.float64),
+        "qty": np.array([], dtype=np.float64),
+        "is_buy": np.array([], dtype=bool),
+    }
+
+
+def empty_depth_bands() -> dict:
+    """No snapshot yet: recv_ts_ms 0 and zero-length sides (input.md)."""
+    return {
+        "anchor_price": 0.0,
+        "bucket_usd": float(DEPTH_BAND_USD),
+        "bids": np.array([], dtype=np.float64),
+        "asks": np.array([], dtype=np.float64),
+        "recv_ts_ms": 0,
+    }
+
+
+def depth_bands_from_book(
+    bids,
+    asks,
+    recv_ms: int,
+    *,
+    bucket_usd: float = DEPTH_BAND_USD,
+    n_bands: int = DEPTH_BANDS,
+) -> dict:
+    """Fold a spot book into absolute $10 bands around the snapshot mid.
+
+    ``bids[i]`` is size in ``[anchor-(i+1)*bucket, anchor-i*bucket)`` and
+    ``asks[i]`` is the mirror above the anchor. The anchor is that snapshot's
+    mid, not the live mid at prediction time.
+    """
+    bid_book = np.asarray(bids, dtype=np.float64)
+    ask_book = np.asarray(asks, dtype=np.float64)
+    if (
+        bid_book.ndim != 2
+        or ask_book.ndim != 2
+        or bid_book.shape[0] == 0
+        or ask_book.shape[0] == 0
+        or bid_book.shape[1] < 2
+        or ask_book.shape[1] < 2
+    ):
+        return empty_depth_bands()
+    anchor = 0.5 * (float(bid_book[0, 0]) + float(ask_book[0, 0]))
+    bucket = float(bucket_usd)
+    if not np.isfinite(anchor) or anchor <= 0.0 or bucket <= 0.0:
+        return empty_depth_bands()
+    bid_qty = np.zeros(int(n_bands), dtype=np.float64)
+    ask_qty = np.zeros(int(n_bands), dtype=np.float64)
+    dist = (anchor - bid_book[:, 0]) / bucket
+    idx = np.ceil(dist - 1e-9).astype(np.int64) - 1
+    bq = bid_book[:, 1]
+    ok = (idx >= 0) & (idx < n_bands) & np.isfinite(bq) & (bq > 0.0)
+    np.add.at(bid_qty, idx[ok], bq[ok])
+    dist_a = (ask_book[:, 0] - anchor) / bucket
+    idx_a = np.floor(dist_a + 1e-9).astype(np.int64)
+    aq = ask_book[:, 1]
+    ok_a = (idx_a >= 0) & (idx_a < n_bands) & np.isfinite(aq) & (aq > 0.0)
+    np.add.at(ask_qty, idx_a[ok_a], aq[ok_a])
+    return {
+        "anchor_price": float(anchor),
+        "bucket_usd": bucket,
+        "bids": bid_qty,
+        "asks": ask_qty,
+        "recv_ts_ms": int(recv_ms),
+    }
 
 
 def _trades(n: int, t0: int, px: float, rng: np.random.Generator) -> dict:
@@ -157,6 +232,59 @@ def _depth_updates(
     return updates
 
 
+def _liquidations(
+    n: int,
+    current_time_ms: int,
+    px: float,
+    rng: np.random.Generator,
+    *,
+    futures: bool,
+) -> dict:
+    """Trailing hour of forced closes. ``is_buy`` is the order side.
+
+    True means the exchange is buying to close a short (price pushed up).
+    Spot has no liquidations.
+    """
+    if not futures or n <= 0:
+        return empty_liquidations()
+    recv = np.linspace(
+        current_time_ms - LIQUIDATION_WINDOW_S * 1000 + 1000,
+        current_time_ms - 200,
+        n,
+        dtype=np.int64,
+    )
+    price = px + rng.normal(0.0, 4.0, size=n)
+    qty = rng.uniform(0.001, 0.3, size=n)
+    is_buy = rng.random(n) < 0.5
+    return {
+        "ts_ms": recv - 40,
+        "recv_ts_ms": recv,
+        "price": price.astype(np.float64),
+        "qty": qty.astype(np.float64),
+        "is_buy": is_buy,
+    }
+
+
+def _depth_bands(
+    px: float,
+    rng: np.random.Generator,
+    current_time_ms: int,
+    *,
+    futures: bool,
+) -> dict:
+    """Spot-only coarse book. Anchor is a past mid, not the live price."""
+    if futures:
+        return empty_depth_bands()
+    anchor = float(px) - 35.0
+    return {
+        "anchor_price": anchor,
+        "bucket_usd": float(DEPTH_BAND_USD),
+        "bids": rng.uniform(0.05, 3.0, size=DEPTH_BANDS).astype(np.float64),
+        "asks": rng.uniform(0.05, 3.0, size=DEPTH_BANDS).astype(np.float64),
+        "recv_ts_ms": int(current_time_ms) - 15_000,
+    }
+
+
 def _venue(
     *,
     current_time_ms: int,
@@ -170,6 +298,7 @@ def _venue(
     n_trades = 6 if compact else (400 if futures else 350)
     n_bt = 8 if compact else (800 if futures else 700)
     n_upd = 2 if compact else 40
+    n_liq = 3 if compact else 12
     n_candles = 8 if compact else CANDLE_WINDOW_S
     candles = _candles(
         n_candles,
@@ -200,6 +329,8 @@ def _venue(
         "depth_start": start,
         "depth_updates": updates,
         "depth_latest": latest,
+        "liquidations": _liquidations(n_liq, current_time_ms, px, rng, futures=futures),
+        "depth_bands": _depth_bands(px, rng, current_time_ms, futures=futures),
         "last_event_times": last_event_times,
     }
 
@@ -211,7 +342,7 @@ def make_sample_payload(
     current_time_ms: int | None = None,
     compact: bool = False,
 ) -> dict:
-    """Build a schema_version-3 payload with NumPy arrays, oldest-first.
+    """Build a schema_version-5 payload with NumPy arrays, oldest-first.
 
     ``current_time_ms`` is the forecast anchor. Candles are a trailing hour and
     trades / book ticker a trailing 60s of shape-faithful synthetic data.
@@ -304,18 +435,47 @@ def _depth_update_from_jsonable(upd: dict, *, futures: bool) -> dict:
         bids = bids.reshape(-1, 2) if bids.size else np.zeros((0, 2), dtype=np.float64)
     if asks.ndim != 2:
         asks = asks.reshape(-1, 2) if asks.size else np.zeros((0, 2), dtype=np.float64)
+    prev = upd.get("prev_final_id")
     out: dict[str, Any] = {
         "recv_ts_ms": np.int64(upd["recv_ts_ms"]),
         "event_ts_ms": np.int64(upd["event_ts_ms"]),
         "first_id": int(upd["first_id"]),
         "final_id": int(upd["final_id"]),
-        "prev_final_id": int(upd["prev_final_id"]),
+        # Spot has no `pu`, so live prompts send null here.
+        "prev_final_id": None if prev is None else int(prev),
         "bids": np.ascontiguousarray(bids, dtype=np.float64),
         "asks": np.ascontiguousarray(asks, dtype=np.float64),
     }
-    if futures:
-        out["transaction_ts_ms"] = np.int64(upd["transaction_ts_ms"])
+    if futures or "transaction_ts_ms" in upd:
+        tx = upd.get("transaction_ts_ms")
+        out["transaction_ts_ms"] = None if tx is None else np.int64(tx)
     return out
+
+
+def _liquidations_from_jsonable(raw: dict | None) -> dict:
+    if not raw:
+        return empty_liquidations()
+    return {
+        "ts_ms": _as_i64(raw.get("ts_ms") or []),
+        "recv_ts_ms": _as_i64(raw.get("recv_ts_ms") or []),
+        "price": _as_f64(raw.get("price") or []),
+        "qty": _as_f64(raw.get("qty") or []),
+        "is_buy": np.asarray(raw.get("is_buy") or [], dtype=bool).reshape(-1),
+    }
+
+
+def _depth_bands_from_jsonable(raw: dict | None) -> dict:
+    if not raw:
+        return empty_depth_bands()
+    bids = _as_f64(raw.get("bids") or []).reshape(-1)
+    asks = _as_f64(raw.get("asks") or []).reshape(-1)
+    return {
+        "anchor_price": float(raw.get("anchor_price") or 0.0),
+        "bucket_usd": float(raw.get("bucket_usd") or DEPTH_BAND_USD),
+        "bids": np.ascontiguousarray(bids, dtype=np.float64),
+        "asks": np.ascontiguousarray(asks, dtype=np.float64),
+        "recv_ts_ms": int(raw.get("recv_ts_ms") or 0),
+    }
 
 
 def _venue_from_jsonable(venue: dict, *, futures: bool) -> dict:
@@ -356,6 +516,8 @@ def _venue_from_jsonable(venue: dict, *, futures: bool) -> dict:
             _depth_update_from_jsonable(u, futures=futures) for u in venue.get("depth_updates") or []
         ],
         "depth_latest": _depth_snapshot_from_jsonable(venue["depth_latest"]),
+        "liquidations": _liquidations_from_jsonable(venue.get("liquidations")),
+        "depth_bands": _depth_bands_from_jsonable(venue.get("depth_bands")),
         "last_event_times": last_events,
     }
 
@@ -403,8 +565,16 @@ def _assert_book_best_first(levels: Any, label: str, *, bids: bool) -> None:
         raise ValueError(label)
 
 
+def _assert_same_len(rows: dict, keys: tuple[str, ...], label: str) -> int:
+    n = len(np.asarray(rows[keys[0]]))
+    for key in keys[1:]:
+        if len(np.asarray(rows[key])) != n:
+            raise ValueError(f"{label}.{key}")
+    return n
+
+
 def assert_payload_schema(payload: dict) -> None:
-    """Fail if the payload does not match input.md schema_version 3."""
+    """Fail if the payload does not match input.md schema_version 5."""
     if int(payload["schema_version"]) != SCHEMA_VERSION:
         raise ValueError("schema_version")
     prompt = payload["prompt"]
@@ -473,11 +643,44 @@ def assert_payload_schema(payload: dict) -> None:
         for upd in venue["depth_updates"]:
             if "event_ts_ms" not in upd:
                 raise ValueError(f"{name}.depth_updates.event_ts_ms")
+            tx = upd.get("transaction_ts_ms", None)
             if futures:
-                if "transaction_ts_ms" not in upd:
-                    raise ValueError("futures.depth_updates.transaction_ts_ms")
-            elif "transaction_ts_ms" in upd:
-                raise ValueError("spot.depth_updates must omit T")
+                if tx is None or upd.get("prev_final_id") is None:
+                    raise ValueError("futures.depth_updates exchange ids")
+            elif tx is not None:
+                raise ValueError("spot.depth_updates T must be null")
+        liq = venue.get("liquidations")
+        if not isinstance(liq, dict):
+            raise ValueError(f"{name}.liquidations")
+        for key in ("ts_ms", "recv_ts_ms", "price", "qty", "is_buy"):
+            if key not in liq:
+                raise ValueError(f"{name}.liquidations.{key}")
+        n_liq = _assert_same_len(
+            liq, ("ts_ms", "recv_ts_ms", "price", "qty", "is_buy"), f"{name}.liquidations"
+        )
+        if not futures and n_liq != 0:
+            raise ValueError("spot.liquidations must be empty")
+        _assert_time_order(liq["recv_ts_ms"], f"{name}.liquidations.recv_ts_ms")
+        bands = venue.get("depth_bands")
+        if not isinstance(bands, dict):
+            raise ValueError(f"{name}.depth_bands")
+        for key in ("anchor_price", "bucket_usd", "bids", "asks", "recv_ts_ms"):
+            if key not in bands:
+                raise ValueError(f"{name}.depth_bands.{key}")
+        band_bids = np.asarray(bands["bids"]).reshape(-1)
+        band_asks = np.asarray(bands["asks"]).reshape(-1)
+        band_recv = int(bands["recv_ts_ms"])
+        if futures:
+            if band_recv != 0 or band_bids.size or band_asks.size:
+                raise ValueError("futures.depth_bands must be empty")
+        elif band_recv == 0:
+            if band_bids.size or band_asks.size:
+                raise ValueError(f"{name}.depth_bands")
+        else:
+            if band_bids.shape != band_asks.shape or float(bands["bucket_usd"]) <= 0.0:
+                raise ValueError(f"{name}.depth_bands")
+            if float(bands["anchor_price"]) <= 0.0:
+                raise ValueError(f"{name}.depth_bands.anchor_price")
         last = venue.get("last_event_times")
         if not isinstance(last, dict):
             raise ValueError(f"{name}.last_event_times")
