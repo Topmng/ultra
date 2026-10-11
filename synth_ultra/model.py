@@ -2,12 +2,12 @@
 
 Two distributions are built from the payload. The mixture ladder keeps wide
 tails for jumps. The candle bins, from the last 30 minutes of 10-second log
-returns, put mass on an unchanged price. Clock prompts whose 90th percentile
-10-second move is within $15 use the candle bins. That quiet regime is where
-those bins beat the mixture, and it is more common on weekends. Hotter prompts
-keep the mixture. On the mixture path the fitted drift is scaled to 85% and
-the last one-second move is added. Top-of-book imbalance shifts the
-center by a fraction of the width, more so after a trade print.
+returns, put mass on an unchanged price. Clock prompts mix the two: the
+candle share is a logistic of the half-hour 90th percentile move, so a quiet
+hour keeps that mass and a louder hour keeps the mixture tails. On the
+mixture path the fitted drift is scaled to 85% and the last one-second move
+is added. Top-of-book imbalance shifts the center by a fraction of the width,
+more so after a trade print.
 Never-raise fallback so a non-answer is not charged under FAQ.md.
 """
 
@@ -1034,9 +1034,12 @@ def _skewed_candle_prices(px: float, bins: np.ndarray, mu_px: float) -> np.ndarr
     return out
 
 
-# Clock prompts whose recent 10-second moves stay inside this dollar band use
-# the candle distribution. Above it, the mixture tails cover the jumps.
-_CALM_P90_USD = 15.0
+# Clock prompts mix the candle distribution with the mixture. The candle
+# weight is a logistic of the half-hour 90th percentile 10-second move:
+# about 0.73 when that move is $0, one half at $12, and gone once the hour
+# is much louder. Chosen on the earlier saved prompts; the later ones agreed.
+_BLEND_PIVOT = 12.0
+_BLEND_TEMP = 12.0
 # The fitted drift runs a little hot. Keep most of it, and add the last
 # one-second move, which the drift underweights.
 _MU_KEEP = 0.85
@@ -1068,28 +1071,66 @@ def _move_p90_usd(close: np.ndarray, px: float) -> float | None:
     return float(np.quantile(abs_r, 0.9) * px)
 
 
+def _candle_weight(p90: float | None, trigger: str, candle_ok: bool) -> float:
+    """Share of the candle distribution on a clock prompt. Zero otherwise."""
+    if trigger != "time" or not candle_ok or p90 is None or not np.isfinite(p90):
+        return 0.0
+    z = (float(p90) - _BLEND_PIVOT) / _BLEND_TEMP
+    if z >= 20.0:
+        return 0.0
+    if z <= -20.0:
+        return 1.0
+    return float(1.0 / (1.0 + np.exp(z)))
+
+
+def _cdf_mix(candle: np.ndarray, mixture: np.ndarray, weight: float) -> np.ndarray:
+    """Quantiles of ``weight * candle + (1 - weight) * mixture``.
+
+    Averaging the quantile functions would place prices in a gap that neither
+    distribution holds. Inverting the mixed CDF keeps the candle's quiet mass
+    and the mixture's tails as two separate possibilities.
+    """
+    w = float(weight)
+    lo = min(float(candle[0]), float(mixture[0]))
+    hi = max(float(candle[-1]), float(mixture[-1]))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return _sanitize((1.0 - w) * mixture + w * candle)
+    grid = np.linspace(lo, hi, 480)
+    fc = np.interp(grid, candle, _TAU, left=0.0, right=1.0)
+    fm = np.interp(grid, mixture, _TAU, left=0.0, right=1.0)
+    cdf = w * fc + (1.0 - w) * fm
+    cdf[0] = 0.0
+    cdf[-1] = 1.0
+    np.maximum.accumulate(cdf, out=cdf)
+    return _sanitize(np.interp(_TAU, cdf, grid))
+
+
 def _combine(
     ladder: np.ndarray,
     candle: np.ndarray | None,
     mu_px: float,
     c1_px: float,
-    calm: bool,
+    p90: float | None,
+    trigger: str,
 ) -> np.ndarray:
-    """Mixture by default, candle distribution when the last half hour is calm.
+    """Mix the candle and mixture distributions on clock prompts.
 
-    Calm clock prompts are where an unchanged 10-second price is common, which
-    is also where the candle bins beat the mixture, including on weekends.
-    Volatile prompts keep the mixture tails. On that path the drift is scaled
-    down slightly and the last one-second move is added.
+    The mixture path scales the fitted drift down slightly and adds the last
+    one-second move. Event prompts stay on that path. Clock prompts add the
+    candle distribution in proportion to how quiet the recent hour has been.
     """
-    if calm and candle is not None:
-        out = np.asarray(candle, dtype=np.float64)
-    else:
-        shift = (_MU_KEEP - 1.0) * float(mu_px) + _C1_KEEP * float(c1_px)
-        out = np.asarray(ladder, dtype=np.float64) + shift
-    out = np.maximum(out, _MIN_PRICE)
-    np.maximum.accumulate(out, out=out)
-    return out
+    shift = (_MU_KEEP - 1.0) * float(mu_px) + _C1_KEEP * float(c1_px)
+    mixture = np.asarray(ladder, dtype=np.float64) + shift
+    mixture = np.maximum(mixture, _MIN_PRICE)
+    np.maximum.accumulate(mixture, out=mixture)
+    weight = _candle_weight(p90, trigger, candle is not None)
+    if candle is None or weight <= 1e-4:
+        return mixture
+    candle_a = np.maximum(np.asarray(candle, dtype=np.float64), _MIN_PRICE)
+    np.maximum.accumulate(candle_a, out=candle_a)
+    if weight >= 1.0 - 1e-4:
+        return candle_a
+    return _cdf_mix(candle_a, mixture, weight)
 
 
 def _forecast_from_parts(
@@ -1180,9 +1221,8 @@ def _forecast_from_parts(
     bins = _candle_abs_bins(closes)
     candle = None if bins is None else _skewed_candle_prices(px, bins, mu_px)
     p90 = _move_p90_usd(closes, px)
-    calm = p90 is not None and p90 <= _CALM_P90_USD and trigger == "time"
     c1_px = float(f["c1"]) * px
-    mixed = _combine(ladder, candle, mu_px, c1_px, calm)
+    mixed = _combine(ladder, candle, mu_px, c1_px, p90, trigger)
     last_mu_px = float(mu_px)
     last_anchor_px = float(px)
     return mixed
