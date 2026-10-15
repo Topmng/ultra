@@ -3,31 +3,41 @@
 Two distributions are built from the payload. The mixture ladder keeps wide
 tails for jumps. The candle bins, from the last 30 minutes of 10-second log
 returns, put mass on an unchanged price. Clock prompts mix the two: the
-candle share is a logistic of the half-hour 90th percentile move, so a quiet
-hour keeps that mass and a louder hour keeps the mixture tails. On the
-mixture path the fitted drift is scaled to 85% and the last one-second move
-is added. Top-of-book imbalance shifts the center by a fraction of the width,
-more so after a trade print.
+candle share is a logistic of the half-hour 90th percentile move, reduced
+when the last minute is hotter than that half hour. A quiet hour keeps the
+candle mass and a louder hour keeps the mixture tails. On the
+mixture path the fitted drift is scaled to 85% and 60% of the last
+one-second move is added. Top-of-book imbalance shifts the center by a
+fraction of the width, more so after a trade print, and a trade print also
+moves the forecast along the last second of futures taker flow. Finally
+``stillness`` puts a point mass on the current microprice, sized by how
+still the live spot and futures quotes have been.
 Never-raise fallback so a non-answer is not charged under FAQ.md.
+
+Every hour-of-candles statistic is read from one pass over the 10-second
+moves (``_Hour``), and scalar steps use ``math`` rather than NumPy wrappers,
+whose per-call overhead dominates at these array sizes.
 """
 
 from __future__ import annotations
 
 import gc
+import math
 
 import numpy as np
 
 from synth_ultra.constants import HORIZON_SECONDS, NUM_PERCENTILES
 from synth_ultra.features import extract, reference_price
 from synth_ultra.season_table import SEAS_ABS as _SEAS_ABS
-from synth_ultra.season_table import SEAS_AC as _SEAS_AC
-from synth_ultra.season_table import SEAS_JUMP as _SEAS_JUMP
 from synth_ultra.season_table import SEAS_REL as _SEAS_REL
+from synth_ultra.stillness import apply as apply_stillness
+from synth_ultra.stillness import still_features, taker_flow
 
 _EPS = 1e-12
 _MIN_PRICE = 1e-8
 _MIN_SIGMA_PX = 0.5
 _MAX_SIGMA_PX = 800.0
+_SQRT_H = math.sqrt(float(HORIZON_SECONDS))
 
 # CRPS-tuned conditional fit. The vectors stay the book/trade signal; _flex_linear
 # rescales their outputs from the last ten minutes of 10-second moves.
@@ -52,7 +62,7 @@ _B_MU = np.array(
         0.2225417214564695,
         -0.09424387369323395,
         0.06611178032601009,
-        0.0,
+        -0.002,
         1.3194603589745686e-05,
         9.25776900504624e-06,
         6.419523696500204e-06,
@@ -104,7 +114,7 @@ _FL = 5e-5
 _SH = 1.20
 _FR = 0.15
 _FV = 0.05
-_SM = 0.90
+_SM = 1.04
 # Residual width map. The coefficients above were fit on one volatility mix, so
 # after a quieter stretch the ladder stays wide of the latest 10s moves.
 # fac = clip(A + B * s_recent / sigma, A, 1): move partway toward that
@@ -223,34 +233,24 @@ _MIX_Z = np.array(
 # Mean absolute deviation of the mixture quantile grid. A price scale of `s`
 # then has the same mean absolute deviation as `s * _MIX_Z`.
 _Z_ABS = float(np.mean(np.abs(_MIX_Z)))
+
+
+def _clip(x: float, lo: float, hi: float) -> float:
+    """Scalar clip. NaN passes through, as with ``np.clip``."""
+    return lo if x < lo else (hi if x > hi else x)
+
+
 def _sanitize(x: np.ndarray) -> np.ndarray:
     out = np.asarray(x, dtype=np.float64).reshape(NUM_PERCENTILES)
-    out = np.nan_to_num(out, nan=_MIN_PRICE, posinf=1e16, neginf=_MIN_PRICE)
+    # A non-finite value makes the sum non-finite, so the slow scrub only runs then.
+    if not math.isfinite(float(out.sum())):
+        out = np.nan_to_num(out, nan=_MIN_PRICE, posinf=1e16, neginf=_MIN_PRICE)
     out = np.maximum(out, _MIN_PRICE)
     np.maximum.accumulate(out, out=out)
-    diffs = np.diff(out)
-    if np.any(diffs <= 0.0):
-        out[1:] += np.cumsum(np.where(diffs <= 0.0, _EPS, 0.0))
+    flat = out[1:] <= out[:-1]
+    if flat.any():
+        out[1:] += np.cumsum(np.where(flat, _EPS, 0.0))
     return out
-
-
-def _realized_mix_scale(close: np.ndarray, px: float) -> float:
-    """Mixture scale whose mean absolute deviation matches recent 10s moves.
-
-    Uses whatever candle history the payload actually carries, so the floor
-    tracks the current regime instead of a fixed volatility constant.
-    """
-    if close.size < 40:
-        return 0.0
-    c = np.maximum(np.asarray(close, dtype=np.float64), 1e-12)
-    step = int(HORIZON_SECONDS)
-    moved = np.log(c[step:] / c[:-step])
-    if moved.size < 30:
-        return 0.0
-    mean_abs = float(np.mean(np.abs(moved - np.median(moved))))
-    if mean_abs <= 0.0 or not np.isfinite(mean_abs):
-        return 0.0
-    return float(px) * mean_abs / _Z_ABS
 
 
 def _venue_closes(venue: dict | None) -> np.ndarray:
@@ -270,13 +270,13 @@ def _spot_closes(payload: dict) -> np.ndarray:
 # Log-blend of the fitted mixture scale with short-horizon 10s volatility.
 # Weights minimize pinball CRPS on the saved pairs. Fast realized vol can
 # both widen and tighten the 100-quantile ladder; the hour-average floor cannot.
-_VOL_W = np.array([0.7199761, 0.18929481, 0.06551382, 0.02521527], dtype=np.float64)
+_VOL_W = (0.7199761, 0.18929481, 0.06551382, 0.02521527)
 _VOL_LOG_BIAS = 0.04421702415367945
 
-
-# Reused across calls. A full hour is a few thousand 10s moves, and the weights
-# depend only on that length, so rebuilding them on every payload is wasted work.
+# Weight vectors depend only on the series length, which is the same few
+# thousand points on nearly every call.
 _EWMA_W: dict[tuple[int, float], np.ndarray] = {}
+_W_CACHE: dict[int, np.ndarray] = {}
 
 
 def _ewma_abs(abs_r: np.ndarray, lam: float = 0.98) -> float:
@@ -293,35 +293,185 @@ def _ewma_abs(abs_r: np.ndarray, lam: float = 0.98) -> float:
     return float(np.dot(w, abs_r))
 
 
-def _vol_aware_scale(fitted: float, close: np.ndarray, px: float) -> float:
-    """Set mixture scale from fitted vol and recent 10s move size.
+def _recency_weights(n: int) -> np.ndarray:
+    """Linear in age. Oldest weight is the smallest, newest the largest, sum 1."""
+    cached = _W_CACHE.get(n)
+    if cached is not None:
+        return cached
+    weights = np.arange(1.0, n + 1.0, dtype=np.float64)
+    weights /= weights.sum()
+    if len(_W_CACHE) < 6:
+        _W_CACHE[n] = weights
+    return weights
 
-    The 100 percentiles are the centered quantiles of a Laplace jump-mixture
-    located at the predicted price. Width tracks a blend of the feature-based
-    scale, the EWMA of recent 10-second absolute moves, 60-second realized
-    vol, and the last 10-second high-low range.
+
+def _median(x: np.ndarray) -> float:
+    """``np.median`` through one partition, without its Python-level overhead."""
+    n = int(x.size)
+    k = n // 2
+    if n % 2:
+        return float(np.partition(x, k)[k])
+    part = np.partition(x, (k - 1, k))
+    return 0.5 * (float(part[k - 1]) + float(part[k]))
+
+
+def _mad(x: np.ndarray) -> float:
+    """Mean absolute deviation from the median."""
+    d = x - _median(x)
+    np.abs(d, out=d)
+    return float(d.sum()) / d.size
+
+
+# Overlapping 10-second close-to-close returns from 1-second candles.
+# 30 minutes is 1,800 closes and 1,790 returns.
+_WIN_30_S = 1800
+_WIN_RET = _WIN_30_S - HORIZON_SECONDS
+_MIN_RETURNS = 40
+_N_BINS = 50
+_BIN_W = 1.0 / _N_BINS
+_BIN_EDGES = np.array([k * _BIN_W for k in range(_N_BINS)] + [1.0], dtype=np.float64)
+_BIN_SPAN = np.diff(_BIN_EDGES)
+# Floor under a mean absolute 10-second log return, and the fast window.
+_ACT_EPS = 1e-6
+_ACT_FAST = 60
+_FLEX_N = 600
+
+
+class _Hour:
+    """Spot 1-second closes and their overlapping 10-second moves.
+
+    Every width step reads the same hour of candles. Taking the log, the
+    10-second differences and their absolute values once keeps a call to a
+    handful of passes over 3,600 points.
     """
-    if close.size < 40 or not np.isfinite(fitted) or fitted <= 0.0:
-        return fitted
-    c = np.maximum(np.asarray(close, dtype=np.float64), 1e-12)
-    moved = np.abs(np.log(c[10:] / c[:-10]))
-    if moved.size < 30:
-        return fitted
-    fast = float(px) * _ewma_abs(moved) / _Z_ABS
-    if c.size >= 61:
-        rets = np.diff(np.log(c[-61:]))
-        rv60 = float(px) * float(np.std(rets) * np.sqrt(10.0)) / _Z_ABS
-    else:
-        rv60 = fast
-    sl = c[-10:]
-    lo = float(np.min(sl))
-    hi = float(np.max(sl))
-    hl10 = float(px) * float(np.log(hi / lo)) / _Z_ABS if lo > 0.0 and hi > lo else fast
-    vals = np.maximum(np.array([fitted, fast, rv60, hl10], dtype=np.float64), 0.3)
-    return float(np.exp(np.dot(_VOL_W, np.log(vals)) + _VOL_LOG_BIAS))
+
+    __slots__ = ("n", "c", "lc", "r10", "a10", "d10")
+
+    def __init__(self, close: np.ndarray) -> None:
+        c = close if isinstance(close, np.ndarray) else np.asarray(close, dtype=np.float64)
+        c = c.reshape(-1)
+        if c.dtype != np.float64:
+            c = c.astype(np.float64)
+        self.n = int(c.size)
+        self.c = c
+        self.lc = self.r10 = self.a10 = self.d10 = None
+        if self.n < 40:
+            return
+        lc = np.log(c)
+        if not math.isfinite(float(lc.sum())):
+            keep = np.isfinite(lc)
+            c = c[keep]
+            lc = lc[keep]
+            self.n = int(c.size)
+            self.c = c
+            if self.n < 40:
+                return
+        h = HORIZON_SECONDS
+        self.lc = lc
+        self.r10 = lc[h:] - lc[:-h]
+        self.a10 = np.abs(self.r10)
+        self.d10 = np.abs(c[h:] - c[:-h])
+
+    def realized_mix(self, px: float) -> float:
+        """Mixture scale whose mean absolute deviation matches the hour's 10s moves."""
+        if self.r10 is None:
+            return 0.0
+        mean_abs = _mad(self.r10)
+        if mean_abs <= 0.0 or not math.isfinite(mean_abs):
+            return 0.0
+        return px * mean_abs / _Z_ABS
+
+    def vol_aware(self, fitted: float, px: float) -> float:
+        """Log-blend the fitted scale with EWMA 10s moves, 60s vol and the 10s range."""
+        if self.a10 is None or not math.isfinite(fitted) or fitted <= 0.0:
+            return fitted
+        fast = px * _ewma_abs(self.a10) / _Z_ABS
+        if self.n >= 61:
+            tail = self.lc[-61:]
+            rets = tail[1:] - tail[:-1]
+            dev = rets - float(rets.sum()) / rets.size
+            std = math.sqrt(float((dev * dev).sum()) / rets.size)
+            rv60 = px * (std * math.sqrt(10.0)) / _Z_ABS
+        else:
+            rv60 = fast
+        sl = self.c[-10:]
+        lo = float(sl.min())
+        hi = float(sl.max())
+        hl10 = px * math.log(hi / lo) / _Z_ABS if lo > 0.0 and hi > lo else fast
+        acc = _VOL_LOG_BIAS
+        for w, v in zip(_VOL_W, (fitted, fast, rv60, hl10)):
+            acc += w * math.log(max(v, 0.3))
+        return math.exp(acc)
+
+    def recent_mad(self, n: int) -> float:
+        """Mean absolute deviation of the last ``n`` 10-second dollar moves."""
+        if self.d10 is None or self.d10.size < n:
+            return 0.0
+        mad = _mad(self.d10[-n:])
+        if not math.isfinite(mad) or mad <= 0.0:
+            return 0.0
+        return mad
+
+    def jump_ratio(self) -> float:
+        """p99 / median of absolute 10-second close changes. Large means unstable."""
+        if self.d10 is None or self.n < 50:
+            return 1e9
+        d = self.d10
+        m = int(d.size)
+        k = m // 2
+        pos = 0.99 * (m - 1)
+        j = int(pos)
+        frac = pos - j
+        j1 = min(j + 1, m - 1)
+        part = np.partition(d, (k - 1, k, j, j1))
+        typical = float(part[k]) if m % 2 else 0.5 * (float(part[k - 1]) + float(part[k]))
+        if typical <= 1e-6 or not math.isfinite(typical):
+            return 1e9
+        a = float(part[j])
+        b = float(part[j1])
+        extreme = a + (b - a) * frac if frac < 0.5 else b - (b - a) * (1.0 - frac)
+        if not math.isfinite(extreme):
+            return 1e9
+        return extreme / typical
+
+    def candle_parts(self, px: float) -> tuple[np.ndarray | None, float | None, float]:
+        """Fifty absolute 10s log-return levels, their dollar p90, and activity.
+
+        All three read the last 30 minutes of returns. Activity is the log
+        ratio of the last minute's mean |10s return| to the half-hour mean.
+        """
+        if self.a10 is None or self.n < HORIZON_SECONDS + _MIN_RETURNS:
+            return None, None, 0.0
+        aw = self.a10[-_WIN_RET:]
+        m = int(aw.size)
+        # Tied returns add the same slope to the running integral in any order,
+        # so an unstable sort gives the same bin means.
+        order = np.argsort(aw)
+        sv = aw[order]
+        bins = _bin_means(sv, _recency_weights(m)[order])
+        pos = 0.9 * (m - 1)
+        i0 = int(pos)
+        frac = pos - i0
+        a = float(sv[i0])
+        b = float(sv[min(i0 + 1, m - 1)])
+        q90 = a + (b - a) * frac if frac < 0.5 else b - (b - a) * (1.0 - frac)
+        activity = 0.0
+        if m >= _ACT_FAST:
+            slow = float(aw.sum()) / m
+            fast = float(aw[-_ACT_FAST:].sum()) / _ACT_FAST
+            activity = math.log((_ACT_EPS + fast) / (_ACT_EPS + slow))
+        return bins, q90 * px, activity
 
 
-def _regime_scale(sigma_px: float, close: np.ndarray) -> float:
+def _realized_mix_scale(close: np.ndarray, px: float) -> float:
+    return _Hour(close).realized_mix(float(px))
+
+
+def _vol_aware_scale(fitted: float, close: np.ndarray, px: float) -> float:
+    return _Hour(close).vol_aware(float(fitted), float(px))
+
+
+def _regime_scale(sigma_px: float, close: np.ndarray, hour: _Hour | None = None) -> float:
     """Shrink a scale that is wide of the latest few minutes of 10s moves.
 
     ``s_recent`` is the mixture scale whose mean absolute deviation matches
@@ -331,20 +481,16 @@ def _regime_scale(sigma_px: float, close: np.ndarray) -> float:
     candle history leaves the feature-model scale unchanged.
     """
     sigma = float(sigma_px)
-    if close.size < _REG_N + 10 or not np.isfinite(sigma) or sigma <= 0.0:
+    if not math.isfinite(sigma) or sigma <= 0.0:
         return sigma
-    c = np.maximum(np.asarray(close, dtype=np.float64), 1e-12)
-    moves = np.abs(c[10:] - c[:-10])
-    if moves.size < _REG_N:
-        return sigma
-    sl = moves[-_REG_N:]
-    mad = float(np.mean(np.abs(sl - np.median(sl))))
-    if mad <= 0.0 or not np.isfinite(mad):
+    h = hour if hour is not None else _Hour(close)
+    mad = h.recent_mad(_REG_N)
+    if mad <= 0.0:
         return sigma
     ratio = (mad / _Z_ABS) / sigma
-    if not np.isfinite(ratio):
+    if not math.isfinite(ratio):
         return sigma
-    return sigma * float(np.clip(_REG_A + _REG_B * ratio, _REG_A, 1.0))
+    return sigma * _clip(_REG_A + _REG_B * ratio, _REG_A, 1.0)
 
 
 # Location gain and a further width step, fit so every 6-hour window improves.
@@ -357,37 +503,25 @@ _MU_PULL = 0.40
 _MU_FLOOR = 0.45
 _WIDE_POW = 0.05
 _WIDE_FLOOR = 0.96
-_FLEX_N = 600
 
 
-def _recent_mad(close: np.ndarray, n: int) -> float:
-    if close.size < n + 10:
-        return 0.0
-    c = np.maximum(np.asarray(close, dtype=np.float64), 1e-12)
-    moves = np.abs(c[10:] - c[:-10])
-    if moves.size < n:
-        return 0.0
-    sl = moves[-n:]
-    mad = float(np.mean(np.abs(sl - np.median(sl))))
-    if not np.isfinite(mad) or mad <= 0.0:
-        return 0.0
-    return mad
-
-
-def _flex_linear(mu_px: float, sigma_px: float, close: np.ndarray) -> tuple[float, float]:
+def _flex_linear(
+    mu_px: float, sigma_px: float, close: np.ndarray, hour: _Hour | None = None
+) -> tuple[float, float]:
     """Rescale the linear location and width from the latest 10-minute moves."""
     mu = float(mu_px)
     sigma = float(sigma_px)
-    mad = _recent_mad(close, _FLEX_N)
-    if mad <= 0.0 or not np.isfinite(sigma) or sigma <= 0.0 or not np.isfinite(mu):
+    h = hour if hour is not None else _Hour(close)
+    mad = h.recent_mad(_FLEX_N)
+    if mad <= 0.0 or not math.isfinite(sigma) or sigma <= 0.0 or not math.isfinite(mu):
         return mu, sigma
     ratio = (mad / _Z_ABS) / sigma
-    if not np.isfinite(ratio) or ratio <= 0.0:
+    if not math.isfinite(ratio) or ratio <= 0.0:
         return mu, sigma
-    fade = float(np.clip(ratio, 0.3, 1.5)) ** -1.0
+    fade = 1.0 / _clip(ratio, 0.3, 1.5)
     excess = max(abs(mu) / sigma - _MU_EXCESS, 0.0)
-    gain = float(np.clip(1.0 - _MU_PULL * excess * fade, _MU_FLOOR, 1.0))
-    width = float(np.clip(ratio ** _WIDE_POW, _WIDE_FLOOR, 1.0))
+    gain = _clip(1.0 - _MU_PULL * excess * fade, _MU_FLOOR, 1.0)
+    width = _clip(ratio**_WIDE_POW, _WIDE_FLOOR, 1.0)
     return mu * gain, sigma * width
 
 
@@ -402,9 +536,9 @@ _BOOK_CAP = 0.18
 # Fold the payload's own 10s book-move quantiles into the ladder when the
 # hour is not a single-outlier regime. p99/median above this means the typical
 # move is ~0 or one crash dominates, and the book sample is a poor center.
-# Weight 0.10 is the largest blend that still lowers every saved day.
+# 0.27 is the blend that lowered both the early and late saved prompts.
 _HIST_JUMP = 12.0
-_HIST_W = 0.18
+_HIST_W = 0.27
 # On a flat hour the fixed ladder is a little wide through the middle.
 # Pull those central quantiles in; leave the outer crash points where they are.
 _CALM_CORE = 0.98
@@ -430,6 +564,15 @@ def _f64_col(x: object) -> np.ndarray:
     return np.asarray(x, dtype=np.float64).reshape(-1)
 
 
+def _i64_col(x: object) -> np.ndarray:
+    if isinstance(x, np.ndarray):
+        arr = x.reshape(-1)
+        if arr.dtype == np.int64:
+            return arr
+        return arr.astype(np.int64, copy=False)
+    return np.asarray(x, dtype=np.int64).reshape(-1)
+
+
 def _book_offsets(book: dict | None) -> np.ndarray | None:
     """Centered quantiles of 10s spot-microprice changes in this payload.
 
@@ -443,12 +586,7 @@ def _book_offsets(book: dict | None) -> np.ndarray | None:
     ts_raw = book.get("recv_ts_ms")
     if ts_raw is None:
         return None
-    if isinstance(ts_raw, np.ndarray):
-        ts = ts_raw.reshape(-1)
-        if ts.dtype != np.int64:
-            ts = ts.astype(np.int64, copy=False)
-    else:
-        ts = np.asarray(ts_raw, dtype=np.int64).reshape(-1)
+    ts = _i64_col(ts_raw)
     if ts.size < 80:
         return None
     bp = _f64_col(book.get("bid_price"))
@@ -464,25 +602,15 @@ def _book_offsets(book: dict | None) -> np.ndarray | None:
     ap = ap[-n:]
     aq = aq[-n:]
     step = 1 if n <= _BOOK_PAIRS else (n + _BOOK_PAIRS - 1) // _BOOK_PAIRS
+    ts_i = ts[::step]
+    j = np.searchsorted(ts, ts_i + 10_000, side="right") - 1
     ii = np.arange(0, n, step, dtype=np.int64)
-    den = bq[ii] + aq[ii]
-    mi = (bp[ii] * aq[ii] + ap[ii] * bq[ii]) / np.maximum(den, 1e-12)
-    bad = den <= 0.0
-    if np.any(bad):
-        mi = mi.copy()
-        mi[bad] = 0.5 * (bp[ii][bad] + ap[ii][bad])
-    j = np.searchsorted(ts, ts[ii] + 10_000, side="right") - 1
-    ok = (j > ii) & (j < n) & (ts[j] >= ts[ii] + 9_000)
-    if int(np.count_nonzero(ok)) < 40:
+    ok = (j > ii) & (ts[j] >= ts_i + 9_000)
+    k = int(np.count_nonzero(ok))
+    if k < 40:
         return None
-    jj = j[ok]
-    denj = bq[jj] + aq[jj]
-    mj = (bp[jj] * aq[jj] + ap[jj] * bq[jj]) / np.maximum(denj, 1e-12)
-    badj = denj <= 0.0
-    if np.any(badj):
-        mj = mj.copy()
-        mj[badj] = 0.5 * (bp[jj][badj] + ap[jj][badj])
-    ordered = np.sort(mj - mi[ok])
+    both = _micro_at(bp, bq, ap, aq, np.concatenate((ii[ok], j[ok])))
+    ordered = np.sort(both[k:] - both[:k])
     m = int(ordered.size)
     half = 0.5 * (m - 1)
     h0 = int(half)
@@ -492,8 +620,23 @@ def _book_offsets(book: dict | None) -> np.ndarray | None:
     i0 = pos.astype(np.int64)
     frac = pos - i0
     i1 = np.minimum(i0 + 1, m - 1)
-    quantiles = ordered[i0] * (1.0 - frac) + ordered[i1] * frac - med
-    return quantiles.astype(np.float64, copy=False)
+    return ordered[i0] * (1.0 - frac) + ordered[i1] * frac - med
+
+
+def _micro_at(
+    bp: np.ndarray, bq: np.ndarray, ap: np.ndarray, aq: np.ndarray, idx: np.ndarray
+) -> np.ndarray:
+    """Microprice at the given ticks. An empty quote falls back to the mid."""
+    b = bp[idx]
+    a = ap[idx]
+    qb = bq[idx]
+    qa = aq[idx]
+    den = qb + qa
+    out = (b * qa + a * qb) / np.maximum(den, 1e-12)
+    bad = den <= 0.0
+    if bad.any():
+        out[bad] = 0.5 * (b[bad] + a[bad])
+    return out
 
 
 def _quote_ofi(book: dict | None, window_ms: int = _OFI_MS) -> float:
@@ -505,37 +648,32 @@ def _quote_ofi(book: dict | None, window_ms: int = _OFI_MS) -> float:
     """
     if not book or book.get("recv_ts_ms") is None:
         return 0.0
-    ts = np.asarray(book["recv_ts_ms"], dtype=np.int64).reshape(-1)
-    bp = np.asarray(book.get("bid_price"), dtype=np.float64).reshape(-1)
-    bq = np.asarray(book.get("bid_qty"), dtype=np.float64).reshape(-1)
-    ap = np.asarray(book.get("ask_price"), dtype=np.float64).reshape(-1)
-    aq = np.asarray(book.get("ask_qty"), dtype=np.float64).reshape(-1)
+    ts = _i64_col(book["recv_ts_ms"])
+    bp = _f64_col(book.get("bid_price"))
+    bq = _f64_col(book.get("bid_qty"))
+    ap = _f64_col(book.get("ask_price"))
+    aq = _f64_col(book.get("ask_qty"))
     n = min(ts.size, bp.size, bq.size, ap.size, aq.size)
     if n < 8:
         return 0.0
     ts = ts[-n:]
-    bp = bp[-n:]
-    bq = bq[-n:]
-    ap = ap[-n:]
-    aq = aq[-n:]
     i0 = max(int(np.searchsorted(ts, int(ts[-1]) - int(window_ms), side="left")), 1)
-    bp = bp[i0 - 1 :]
-    bq = bq[i0 - 1 :]
-    ap = ap[i0 - 1 :]
-    aq = aq[i0 - 1 :]
-    if bp.size < 3:
+    k = n - (i0 - 1)
+    if k < 3:
         return 0.0
-    dbp = np.diff(bp)
-    dbq = np.diff(bq)
-    dap = np.diff(ap)
-    daq = np.diff(aq)
-    e_bid = np.where(dbp > 0.0, bq[1:], np.where(dbp < 0.0, -bq[:-1], dbq))
-    e_ask = np.where(dap < 0.0, aq[1:], np.where(dap > 0.0, -aq[:-1], daq))
-    gross = float(np.sum(np.abs(e_bid) + np.abs(e_ask)))
-    if gross <= 0.0 or not np.isfinite(gross):
+    bp = bp[-k:]
+    bq = bq[-k:]
+    ap = ap[-k:]
+    aq = aq[-k:]
+    dbp = bp[1:] - bp[:-1]
+    dap = ap[1:] - ap[:-1]
+    e_bid = np.where(dbp > 0.0, bq[1:], np.where(dbp < 0.0, -bq[:-1], bq[1:] - bq[:-1]))
+    e_ask = np.where(dap < 0.0, aq[1:], np.where(dap > 0.0, -aq[:-1], aq[1:] - aq[:-1]))
+    gross = float((np.abs(e_bid) + np.abs(e_ask)).sum())
+    if gross <= 0.0 or not math.isfinite(gross):
         return 0.0
-    net = float(np.sum(e_bid - e_ask))
-    if not np.isfinite(net):
+    net = float((e_bid - e_ask).sum())
+    if not math.isfinite(net):
         return 0.0
     return net / gross
 
@@ -554,19 +692,18 @@ def _mix_book(
     if offsets is None:
         offsets = _book_offsets(book)
     sigma = float(sigma_px)
-    if offsets is None or not np.isfinite(sigma) or sigma <= 0.0:
+    if offsets is None or not math.isfinite(sigma) or sigma <= 0.0:
         return level
-    mad = float(np.mean(np.abs(offsets)))
-    if mad <= 0.0 or not np.isfinite(mad):
+    mad = float(np.abs(offsets).sum()) / offsets.size
+    if mad <= 0.0 or not math.isfinite(mad):
         return level
     rel = mad / (sigma * _Z_ABS)
-    if not np.isfinite(rel):
+    if not math.isfinite(rel):
         return level
-    weight = float(np.clip(book_slope * max(book_pivot - rel, 0.0), 0.0, book_cap))
+    weight = _clip(book_slope * max(book_pivot - rel, 0.0), 0.0, book_cap)
     if weight <= 0.0:
         return level
-    mixed = (1.0 - weight) * level + weight * (float(px) + offsets)
-    return _sanitize(mixed)
+    return (1.0 - weight) * level + weight * (float(px) + offsets)
 
 
 def _blend_scale(fitted: float, realized: float) -> float:
@@ -577,175 +714,14 @@ def _blend_scale(fitted: float, realized: float) -> float:
     the gap and is the holdout minimum between 'ignore the hour' and 'replace
     the fitted scale outright'.
     """
-    if not np.isfinite(realized) or realized <= fitted or fitted <= 0.0:
+    if not math.isfinite(realized) or realized <= fitted or fitted <= 0.0:
         return fitted
-    return float(fitted * (realized / fitted) ** 0.8)
+    return fitted * (realized / fitted) ** 0.8
 
 
 def _hist_jump_ratio(close: np.ndarray) -> float:
     """p99 / median of absolute 10-second close changes. Large means unstable."""
-    if close.size < 50:
-        return 1e9
-    moves = np.abs(close[10:] - close[:-10])
-    if moves.size < 40:
-        return 1e9
-    typical = float(np.median(moves))
-    if typical <= 1e-6 or not np.isfinite(typical):
-        return 1e9
-    extreme = float(np.quantile(moves, 0.99))
-    if not np.isfinite(extreme):
-        return 1e9
-    return extreme / typical
-
-
-def _dollar_moves(close: np.ndarray) -> np.ndarray:
-    c = np.maximum(np.asarray(close, dtype=np.float64), 1e-12)
-    if c.size < 30:
-        return np.empty(0, dtype=np.float64)
-    return np.abs(c[10:] - c[:-10])
-
-
-def _block_levels(moves: np.ndarray, n_blocks: int, q: float) -> tuple[np.ndarray, int] | None:
-    """Per-block quantile via one sort. Matches ``np.quantile(..., method='linear')``."""
-    n = int(moves.size)
-    block = n // n_blocks
-    if block < 1:
-        return None
-    ordered = np.sort(
-        np.ascontiguousarray(moves[: n_blocks * block].reshape(n_blocks, block)),
-        axis=1,
-    )
-    pos = float(q) * (block - 1)
-    i0 = int(pos)
-    frac = pos - i0
-    i1 = min(i0 + 1, block - 1)
-    levels = ordered[:, i0] * (1.0 - frac) + ordered[:, i1] * frac
-    return levels, block
-
-
-def _calm_parts(moves: np.ndarray) -> tuple[np.ndarray, np.ndarray | None]:
-    """Suffix of the current regime, plus the 80th percentile of each kept block.
-
-    A trailing run of blocks no hotter than the latest one, within the
-    series' own block-to-block scatter, is the current regime. The kept
-    suffix is at least 180 points. A stable hour keeps everything. Short
-    history returns the series and no block levels.
-    """
-    n = int(moves.size)
-    if n <= 180:
-        return moves, None
-    found = _block_levels(moves, 12, 0.80)
-    if found is None:
-        return moves, None
-    levels, block = found
-    if block < 15:
-        return moves, None
-    scatter = float(np.median(np.abs(np.diff(levels)))) + 1e-9
-    last = float(levels[-1])
-    keep = 1
-    for val in levels[-2::-1]:
-        if float(val) <= last + 2.0 * scatter:
-            keep += 1
-        else:
-            break
-    start = min(n - keep * block, n - 180)
-    return moves[max(start, 0) :], levels[-keep:]
-
-
-def _calm_suffix(moves: np.ndarray) -> np.ndarray:
-    """Drop an older, hotter regime. The kept suffix is at least 180 points."""
-    return _calm_parts(moves)[0]
-
-
-def _ewm_quantile(moves: np.ndarray, q: float) -> float:
-    """Quantile with weights that put the newest point well above the oldest.
-
-    The decay is set from the window length so the oldest point still has a
-    few percent of the newest weight. A long window is thinned to every 4th
-    move first, covering the same time span at a fraction of the sort cost.
-    """
-    n = int(moves.size)
-    if n == 0:
-        return 0.0
-    if n < 8:
-        return float(np.quantile(moves, q))
-    if n > 480:
-        moves = moves[::4]
-        n = int(moves.size)
-    log_lam = float(np.log(0.05) / n)
-    w = np.exp(log_lam * np.arange(n - 1, -1, -1, dtype=np.float64))
-    w /= np.sum(w)
-    order = np.argsort(moves, kind="mergesort")
-    cw = np.cumsum(w[order])
-    idx = int(np.searchsorted(cw, q, side="left"))
-    return float(moves[order[min(idx, n - 1)]])
-
-
-def _venue_move_scale(close: np.ndarray) -> tuple[float, float]:
-    """Return (dollar scale, precision weight) from one venue's candles."""
-    moves = _dollar_moves(close)
-    if moves.size < 40:
-        return 0.0, 0.0
-    suffix, kept = _calm_parts(moves)
-    scale = _ewm_quantile(suffix, 0.80)
-    if not np.isfinite(scale) or scale <= 0.0:
-        return 0.0, 0.0
-    # Stability of the blocks already scored while choosing the suffix.
-    if kept is not None and kept.size >= 3:
-        scatter = float(np.median(np.abs(np.diff(kept))))
-    else:
-        scatter = scale
-    precision = 1.0 / (scatter + 1e-6)
-    return scale, precision
-
-
-def _raw_reference_scale(payload: dict) -> float:
-    """Dollar scale of recent venue moves. Zero when the hour has no scale."""
-    venues = payload.get("venues") or {}
-    s_scale, s_w = _venue_move_scale(_venue_closes(venues.get("spot")))
-    fut = venues.get("futures") or {}
-    fut_close = (
-        _venue_closes(fut)
-        if bool((fut.get("candles_1s") or {}).get("complete_history"))
-        else np.empty(0, dtype=np.float64)
-    )
-    f_scale, f_w = _venue_move_scale(fut_close)
-    weight = s_w + f_w
-    if weight <= 0.0 or not np.isfinite(weight):
-        return 0.0
-    ref = (s_w * s_scale + f_w * f_scale) / weight
-    if not np.isfinite(ref) or ref <= 0.0:
-        return 0.0
-    return float(ref)
-
-
-def _reference_scale(payload: dict, sigma_px: float) -> float:
-    """Dollar scale the location shift is allowed to approach.
-
-    Uses the full candle history of spot and, when futures history is
-    complete, futures. Each venue is exponentially weighted and then blended
-    by how stable its own scale has been, so the mix is not fixed at 50:50.
-    Compared with the model scale by the caller: a louder hour keeps the
-    location shift, a quieter hour does not.
-    """
-    ref = _raw_reference_scale(payload)
-    if ref <= 0.0:
-        return float(sigma_px)
-    return ref
-
-
-def _reliable_shift(mu_px: float, scale_px: float) -> float:
-    """Shrink a price shift that is large relative to ``scale_px``.
-
-    Weight = scale / (scale + |shift|). It stays near 1 when the shift sits
-    inside the scale and falls when the shift would move the median by a
-    large fraction of that scale. The scale is taken from the live payload.
-    """
-    shift = float(mu_px)
-    scale = float(scale_px)
-    if not np.isfinite(shift) or not np.isfinite(scale) or scale <= 0.0:
-        return 0.0
-    return shift * (scale / (scale + abs(shift)))
+    return _Hour(close).jump_ratio()
 
 
 def _ladder(px: float, mu_px: float, sigma_px: float) -> np.ndarray:
@@ -783,7 +759,7 @@ def _mu_vec(f: dict[str, float], vol10: float) -> np.ndarray:
             flow,
             imb * vol10,
             flow * vol10,
-            np.tanh(f["c1"] * 3000.0),
+            math.tanh(f["c1"] * 3000.0),
             f["basis"] * vol10,
         ],
         dtype=np.float64,
@@ -793,7 +769,7 @@ def _mu_vec(f: dict[str, float], vol10: float) -> np.ndarray:
 def _abs_vec(f: dict[str, float], vol10: float, vol_fast10: float) -> np.ndarray:
     rng = max(f["s_rng"], f["f_rng"])
     rv = max(f["s_rv"], f["f_rv"])
-    log_fqty = np.log1p(max(f["f_qty2"], 0.0)) / 10.0
+    log_fqty = math.log1p(max(f["f_qty2"], 0.0)) / 10.0
     return np.array(
         [
             vol10,
@@ -811,7 +787,7 @@ def _abs_vec(f: dict[str, float], vol10: float, vol_fast10: float) -> np.ndarray
             abs(f["obi"]),
             abs(f["flow_fast"]),
             f["spread_rel"],
-            np.log1p(max(f["s_qty2"], 0.0)) / 10.0,
+            math.log1p(max(f["s_qty2"], 0.0)) / 10.0,
             log_fqty,
             1.0,
             f["c1"],
@@ -836,16 +812,8 @@ def _abs_vec(f: dict[str, float], vol10: float, vol_fast10: float) -> np.ndarray
 # season_table.py. The 1-minute price file is not read at inference.
 _SEAS_W = 0.35
 _SEAS_CLIP = 0.35
-# Fade a shift that continues the last 10s move when this hour's 1-minute
-# returns historically reverse. Zero turns the fade off.
-_SEAS_MU_K = 0.0
-_SEAS_MU_AC = -0.02
-_SEAS_MU_CLIP = 0.45
-# Extra width when this hour is historically hotter than the previous hour.
-_SEAS_JUMP_W = 0.0
-_SEAS_JUMP_CLIP = 0.18
 # Weekend slots quieter than this fraction of the same weekday hour trust
-# the payload's own 10s book quantiles more. Zero turns that boost off.
+# the payload's own 10s book quantiles more.
 _SEAS_QUIET_REL = 0.70
 _SEAS_QUIET_CAP = 0.85
 _SEAS_QUIET_PIVOT = 1.00
@@ -872,44 +840,18 @@ def _season_scale(sigma_px: float, px: float, now_ms: int) -> float:
     sigma = float(sigma_px)
     price = float(px)
     if (
-        not np.isfinite(sigma)
+        not math.isfinite(sigma)
         or sigma <= 0.0
-        or not np.isfinite(price)
+        or not math.isfinite(price)
         or price <= 0.0
         or int(now_ms) < 0
     ):
         return sigma
-    idx = _slot_index(now_ms)
-    seas = price * float(_SEAS_ABS[idx]) / _Z_ABS
-    if not np.isfinite(seas) or seas <= 0.0:
+    seas = price * float(_SEAS_ABS[_slot_index(now_ms)]) / _Z_ABS
+    if not math.isfinite(seas) or seas <= 0.0:
         return sigma
-    gap = float(np.log(seas) - np.log(sigma))
-    adj = float(np.clip(_SEAS_W * gap, -_SEAS_CLIP, _SEAS_CLIP))
-    if _SEAS_JUMP_W != 0.0:
-        jump = float(_SEAS_JUMP[idx])
-        if np.isfinite(jump):
-            adj += float(np.clip(_SEAS_JUMP_W * jump, -_SEAS_JUMP_CLIP, _SEAS_JUMP_CLIP))
-    return sigma * float(np.exp(adj))
-
-
-def _season_location(mu_px: float, now_ms: int, momentum: float) -> float:
-    """Shrink a continuation bet in hours that historically reverse.
-
-    ``SEAS_AC`` is the lag-1 autocorrelation of 1-minute returns. It is
-    negative on Saturday. The fade applies only when the shift has the same
-    sign as the last 10-second move, so a fade that is already against that
-    move is left alone.
-    """
-    mu = float(mu_px)
-    if _SEAS_MU_K == 0.0 or not np.isfinite(mu) or int(now_ms) < 0:
-        return mu
-    ac = float(_SEAS_AC[_slot_index(now_ms)])
-    if not np.isfinite(ac) or ac > _SEAS_MU_AC:
-        return mu
-    if mu * float(momentum) <= 0.0:
-        return mu
-    gain = float(np.exp(np.clip(_SEAS_MU_K * ac, -_SEAS_MU_CLIP, 0.0)))
-    return mu * gain
+    adj = _clip(_SEAS_W * (math.log(seas) - math.log(sigma)), -_SEAS_CLIP, _SEAS_CLIP)
+    return sigma * math.exp(adj)
 
 
 def _season_book(now_ms: int) -> tuple[float, float, float]:
@@ -925,7 +867,7 @@ def _season_book(now_ms: int) -> tuple[float, float, float]:
     if idx // 144 < 5:
         return _BOOK_CAP, _BOOK_PIVOT, _BOOK_SLOPE
     rel = float(_SEAS_REL[idx])
-    if np.isfinite(rel) and rel < _SEAS_QUIET_REL:
+    if math.isfinite(rel) and rel < _SEAS_QUIET_REL:
         return _SEAS_QUIET_CAP, _SEAS_QUIET_PIVOT, _SEAS_QUIET_SLOPE
     return _BOOK_CAP, _BOOK_PIVOT, _BOOK_SLOPE
 
@@ -935,62 +877,35 @@ def _season_book(now_ms: int) -> tuple[float, float, float]:
 last_mu_px = float("nan")
 last_anchor_px = float("nan")
 
-# Overlapping 10-second close-to-close returns from 1-second candles.
-# 30 minutes is 1,800 closes and 1,790 returns.
-_WIN_30_S = 1800
-_MIN_RETURNS = 40
-_N_BINS = 50
-_BIN_W = 1.0 / _N_BINS
 # |μ| / mean(|log return|) above this would push one wing through the anchor.
 _MU_ALPHA_CAP = 1.0
-_W_CACHE: dict[int, np.ndarray] = {}
-
-
-def _recency_weights(n: int) -> np.ndarray:
-    """Linear in age. Oldest weight is the smallest, newest the largest, sum 1."""
-    cached = _W_CACHE.get(n)
-    if cached is not None:
-        return cached
-    weights = np.arange(1.0, n + 1.0, dtype=np.float64)
-    weights /= weights.sum()
-    if len(_W_CACHE) < 6:
-        _W_CACHE[n] = weights
-    return weights
-
-
-def _window_closes(close: np.ndarray) -> np.ndarray:
-    """Last 30 minutes of closes. A shorter history is used as it stands."""
-    if int(close.size) >= _WIN_30_S:
-        return close[-_WIN_30_S:]
-    return close
 
 
 def _bin_means(sorted_values: np.ndarray, sorted_weights: np.ndarray) -> np.ndarray:
     """Average of each 0.02 mass slice, walking the sorted absolute returns.
 
     A point whose weight crosses a boundary contributes to each slice in
-    proportion to the weight that falls inside it.
+    proportion to the weight that falls inside it. The running integral of
+    value over mass is linear between points, so each slice is a difference
+    of that integral at its two edges.
     """
-    cw = np.cumsum(sorted_weights)
-    total = float(cw[-1]) if cw.size else 0.0
-    if total <= 0.0 or not np.isfinite(total):
+    n = int(sorted_values.size)
+    if n == 0:
         return np.zeros(_N_BINS, dtype=np.float64)
-    left = cw - sorted_weights
-    cw = cw / total
-    left = left / total
-    means = np.empty(_N_BINS, dtype=np.float64)
-    overlap = np.empty(sorted_values.shape, dtype=np.float64)
-    for k in range(_N_BINS):
-        lo = k * _BIN_W
-        hi = 1.0 if k == _N_BINS - 1 else (k + 1) * _BIN_W
-        np.minimum(cw, hi, out=overlap)
-        overlap -= np.maximum(left, lo)
-        np.maximum(overlap, 0.0, out=overlap)
-        wsum = float(overlap.sum())
-        if wsum <= 0.0:
-            means[k] = means[k - 1] if k else 0.0
-        else:
-            means[k] = float(np.dot(overlap, sorted_values) / wsum)
+    cw = np.cumsum(sorted_weights)
+    total = float(cw[-1])
+    if total <= 0.0 or not math.isfinite(total):
+        return np.zeros(_N_BINS, dtype=np.float64)
+    mass = np.empty(n + 1, dtype=np.float64)
+    mass[0] = 0.0
+    np.divide(cw, total, out=mass[1:])
+    area = np.empty(n + 1, dtype=np.float64)
+    area[0] = 0.0
+    np.cumsum(sorted_weights * sorted_values, out=area[1:])
+    area[1:] /= total
+    g = np.interp(_BIN_EDGES, mass, area)
+    means = g[1:] - g[:-1]
+    means /= _BIN_SPAN
     np.maximum.accumulate(means, out=means)
     np.maximum(means, 0.0, out=means)
     return means
@@ -998,17 +913,7 @@ def _bin_means(sorted_values: np.ndarray, sorted_weights: np.ndarray) -> np.ndar
 
 def _candle_abs_bins(close: np.ndarray) -> np.ndarray | None:
     """Fifty absolute 10-second log-return levels from the recent candle window."""
-    if close.size < HORIZON_SECONDS + _MIN_RETURNS:
-        return None
-    c = np.maximum(_window_closes(np.asarray(close, dtype=np.float64)), 1e-12)
-    if not np.all(np.isfinite(c)):
-        c = np.maximum(np.nan_to_num(c, nan=1e-12, posinf=1e-12, neginf=1e-12), 1e-12)
-    abs_r = np.abs(np.log(c[HORIZON_SECONDS:]) - np.log(c[:-HORIZON_SECONDS]))
-    if int(abs_r.size) < _MIN_RETURNS or not np.all(np.isfinite(abs_r)):
-        return None
-    weights = _recency_weights(int(abs_r.size))
-    order = np.argsort(abs_r, kind="mergesort")
-    return _bin_means(abs_r[order], weights[order])
+    return _Hour(close).candle_parts(1.0)[0]
 
 
 def _skewed_candle_prices(px: float, bins: np.ndarray, mu_px: float) -> np.ndarray:
@@ -1018,17 +923,18 @@ def _skewed_candle_prices(px: float, bins: np.ndarray, mu_px: float) -> np.ndarr
     same fraction of each level's own distance from the anchor. Levels that
     are exactly zero — unchanged 10-second candles — stay on the anchor.
     """
-    scale = float(np.mean(bins))
+    scale = float(bins.sum()) / bins.size
     mu_ret = float(mu_px) / float(px) if px > 0.0 else 0.0
     alpha = 0.0
-    if scale > 1e-18 and np.isfinite(mu_ret) and np.isfinite(scale):
-        alpha = float(np.clip(mu_ret / scale, -_MU_ALPHA_CAP, _MU_ALPHA_CAP))
-    upper = bins * (1.0 + alpha)
-    lower = bins * (1.0 - alpha)
-    out = np.empty(NUM_PERCENTILES, dtype=np.float64)
-    out[:_N_BINS] = px * np.exp(-lower[::-1])
-    out[_N_BINS:] = px * np.exp(upper)
-    np.nan_to_num(out, copy=False, nan=_MIN_PRICE, posinf=1e16, neginf=_MIN_PRICE)
+    if scale > 1e-18 and math.isfinite(mu_ret) and math.isfinite(scale):
+        alpha = _clip(mu_ret / scale, -_MU_ALPHA_CAP, _MU_ALPHA_CAP)
+    expo = np.empty(NUM_PERCENTILES, dtype=np.float64)
+    np.multiply(bins[::-1], -(1.0 - alpha), out=expo[:_N_BINS])
+    np.multiply(bins, 1.0 + alpha, out=expo[_N_BINS:])
+    out = np.exp(expo)
+    out *= px
+    if not math.isfinite(float(out.sum())):
+        np.nan_to_num(out, copy=False, nan=_MIN_PRICE, posinf=1e16, neginf=_MIN_PRICE)
     np.maximum(out, _MIN_PRICE, out=out)
     np.maximum.accumulate(out, out=out)
     return out
@@ -1036,14 +942,17 @@ def _skewed_candle_prices(px: float, bins: np.ndarray, mu_px: float) -> np.ndarr
 
 # Clock prompts mix the candle distribution with the mixture. The candle
 # weight is a logistic of the half-hour 90th percentile 10-second move:
-# about 0.73 when that move is $0, one half at $12, and gone once the hour
-# is much louder. Chosen on the earlier saved prompts; the later ones agreed.
-_BLEND_PIVOT = 12.0
-_BLEND_TEMP = 12.0
-# The fitted drift runs a little hot. Keep most of it, and add the last
-# one-second move, which the drift underweights.
+# about 0.70 when that move is $0, one half at $7.5, and gone once the hour
+# is much louder. A hotter last minute, relative to that half hour, lowers
+# the candle share. Pivot and temperature were re-chosen with the stillness
+# point mass in place; both halves of the saved prompts agreed.
+_BLEND_PIVOT = 7.5
+_BLEND_TEMP = 9.0
+_BLEND_BETA = 0.12
+# The fitted drift runs a little hot. Keep most of it, and add part of the
+# last one-second move, which the drift underweights.
 _MU_KEEP = 0.85
-_C1_KEEP = 0.70
+_C1_KEEP = 0.60
 # Buy-liquidation and re-anchored depth-band shifts, as a fraction of width.
 _LIQ_K = 0.04
 _BAND_K = 0.03
@@ -1056,53 +965,137 @@ _IMB_EVENT = 0.50
 # otherwise pull it back toward spot. Applied when |imbalance| exceeds the cut.
 _LOUD_IMB = 0.60
 _LOUD_BOOK = 0.60
-# A trade print is followed by a larger 10-second move than the feature width.
-_EVENT_SIGMA = 1.05
+# Non-clock forecasts are tight between the 25% and 75% prices: that central
+# interval covered 46.8% on both the early and later saved prompts. This
+# fraction of the inner quartile gap is added outside the median. It fades to
+# zero at the median and at the 10% and 90% prices. 0.08 is where both slices
+# bottomed.
+_EVENT_CENTER = 0.08
+_EVENT_TENT = np.zeros(_TAU.shape, dtype=np.float64)
+_left_band = (_TAU > 0.10) & (_TAU < 0.50)
+_EVENT_TENT[_left_band] = np.where(
+    _TAU[_left_band] <= 0.25,
+    (_TAU[_left_band] - 0.10) / 0.15,
+    (0.50 - _TAU[_left_band]) / 0.25,
+)
+_right_band = (_TAU > 0.50) & (_TAU < 0.90)
+_EVENT_TENT[_right_band] = np.where(
+    _TAU[_right_band] <= 0.75,
+    (_TAU[_right_band] - 0.50) / 0.25,
+    (0.90 - _TAU[_right_band]) / 0.15,
+)
+_EVENT_TENT[:11] = 0.0
+_EVENT_TENT[49:51] = 0.0
+_EVENT_TENT[89:] = 0.0
+_EVENT_LEFT = _TAU < 0.50
 
 
-def _move_p90_usd(close: np.ndarray, px: float) -> float | None:
-    """90th percentile of absolute 10-second dollar moves over the recent window."""
-    if close.size < HORIZON_SECONDS + _MIN_RETURNS:
-        return None
-    c = np.maximum(_window_closes(np.asarray(close, dtype=np.float64)), 1e-12)
-    abs_r = np.abs(np.log(c[HORIZON_SECONDS:]) - np.log(c[:-HORIZON_SECONDS]))
-    if int(abs_r.size) < _MIN_RETURNS or not np.all(np.isfinite(abs_r)):
-        return None
-    return float(np.quantile(abs_r, 0.9) * px)
+def _widen_event_center(pct: np.ndarray) -> np.ndarray:
+    """Move the 25% price down and the 75% price up.
+
+    Clock forecasts do not come through here. The median, the 10% and 90%
+    prices, and every quantile outside that band are copied from the input.
+    """
+    q = np.asarray(pct, dtype=np.float64)
+    q25 = 0.5 * (float(q[24]) + float(q[25]))
+    q50 = 0.5 * (float(q[49]) + float(q[50]))
+    q75 = 0.5 * (float(q[74]) + float(q[75]))
+    gap = np.where(_EVENT_LEFT, -_EVENT_CENTER * (q50 - q25), _EVENT_CENTER * (q75 - q50))
+    return _sanitize(q + gap * _EVENT_TENT)
 
 
-def _candle_weight(p90: float | None, trigger: str, candle_ok: bool) -> float:
+def _candle_weight(
+    p90: float | None, trigger: str, candle_ok: bool, activity: float
+) -> float:
     """Share of the candle distribution on a clock prompt. Zero otherwise."""
-    if trigger != "time" or not candle_ok or p90 is None or not np.isfinite(p90):
+    if trigger != "time" or not candle_ok or p90 is None or not math.isfinite(p90):
         return 0.0
-    z = (float(p90) - _BLEND_PIVOT) / _BLEND_TEMP
+    z = (float(p90) - _BLEND_PIVOT) / _BLEND_TEMP + _BLEND_BETA * float(activity)
     if z >= 20.0:
         return 0.0
     if z <= -20.0:
         return 1.0
-    return float(1.0 / (1.0 + np.exp(z)))
+    return 1.0 / (1.0 + math.exp(z))
+
+
+def _component_parts(q: np.ndarray, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Right-continuous CDF and point mass of a piecewise-linear quantile function.
+
+    A run of equal prices is an atom: the CDF at that price is the rightmost
+    tau sitting on it, and its mass spans that run. Past the last price the
+    CDF is 1, and the last price also carries the open right tail.
+    """
+    right_n = np.searchsorted(q, x, side="right")
+    left_i = np.searchsorted(q, x, side="left")
+    idx = right_n - 1
+    out = np.zeros(x.shape, dtype=np.float64)
+    last = q.size - 1
+    hi = idx >= last
+    mid = (idx >= 0) & ~hi
+    out[hi] = 1.0
+    if mid.any():
+        i = idx[mid]
+        q_i = q[i]
+        span = q[i + 1] - q_i
+        frac = np.zeros(i.shape, dtype=np.float64)
+        ok = span > 1e-18
+        frac[ok] = (x[mid][ok] - q_i[ok]) / span[ok]
+        np.clip(frac, 0.0, 1.0, out=frac)
+        t_i = _TAU[i]
+        out[mid] = t_i + (_TAU[i + 1] - t_i) * frac
+    mass = np.zeros(x.shape, dtype=np.float64)
+    multi = (idx > left_i) & (left_i < q.size)
+    if multi.any():
+        mass[multi] = _TAU[idx[multi]] - _TAU[left_i[multi]]
+    mass[x == q[-1]] += 1.0 - float(_TAU[-1])
+    return out, mass
 
 
 def _cdf_mix(candle: np.ndarray, mixture: np.ndarray, weight: float) -> np.ndarray:
     """Quantiles of ``weight * candle + (1 - weight) * mixture``.
 
-    Averaging the quantile functions would place prices in a gap that neither
-    distribution holds. Inverting the mixed CDF keeps the candle's quiet mass
-    and the mixture's tails as two separate possibilities.
+    The two quantile functions are inverted on their sorted breakpoints.
+    Repeated prices stay a point mass instead of being smeared across a
+    uniform price grid. Probability below the first represented tau sits on
+    the left endpoint, and probability above the last sits on the right
+    endpoint of the component that owns that tail. Between breakpoints the
+    quantile is linear in probability.
     """
     w = float(weight)
-    lo = min(float(candle[0]), float(mixture[0]))
-    hi = max(float(candle[-1]), float(mixture[-1]))
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        return _sanitize((1.0 - w) * mixture + w * candle)
-    grid = np.linspace(lo, hi, 480)
-    fc = np.interp(grid, candle, _TAU, left=0.0, right=1.0)
-    fm = np.interp(grid, mixture, _TAU, left=0.0, right=1.0)
-    cdf = w * fc + (1.0 - w) * fm
-    cdf[0] = 0.0
-    cdf[-1] = 1.0
-    np.maximum.accumulate(cdf, out=cdf)
-    return _sanitize(np.interp(_TAU, cdf, grid))
+    c = candle
+    m = mixture
+    knots = np.unique(np.concatenate((c, m)))
+    if knots.size < 2 or not math.isfinite(w):
+        return _sanitize((1.0 - w) * m + w * c)
+    if bool((m[1:] > m[:-1]).all()):
+        # A strictly increasing ladder has no atoms: its CDF is a plain
+        # interpolation, and its only point mass is the open right tail.
+        top = knots >= m[-1]
+        cdf_m = np.interp(knots, m, _TAU, left=0.0, right=1.0)
+        cdf_m[top] = 1.0
+        atom_m = np.where(knots == m[-1], 1.0 - float(_TAU[-1]), 0.0)
+    else:
+        cdf_m, atom_m = _component_parts(m, knots)
+    cdf_c, atom_c = _component_parts(c, knots)
+    right = w * cdf_c + (1.0 - w) * cdf_m
+    jump = w * atom_c + (1.0 - w) * atom_m
+    np.maximum.accumulate(right, out=right)
+    right[-1] = 1.0
+    left = np.maximum(right - jump, 0.0)
+    left[0] = 0.0
+    np.minimum(left, right, out=left)
+    j = np.clip(np.searchsorted(right, _TAU, side="left"), 0, knots.size - 1)
+    out = knots[j]
+    prev = np.maximum(j - 1, 0)
+    r_prev = right[prev]
+    l_j = left[j]
+    span = l_j - r_prev
+    cont = (_TAU <= l_j + 1e-15) & (j > 0) & (span > 1e-15)
+    if cont.any():
+        frac = np.clip((_TAU[cont] - r_prev[cont]) / span[cont], 0.0, 1.0)
+        k_prev = knots[prev[cont]]
+        out[cont] = k_prev + frac * (knots[j[cont]] - k_prev)
+    return _sanitize(out)
 
 
 def _combine(
@@ -1112,25 +1105,25 @@ def _combine(
     c1_px: float,
     p90: float | None,
     trigger: str,
+    activity: float,
 ) -> np.ndarray:
     """Mix the candle and mixture distributions on clock prompts.
 
     The mixture path scales the fitted drift down slightly and adds the last
     one-second move. Event prompts stay on that path. Clock prompts add the
-    candle distribution in proportion to how quiet the recent hour has been.
+    candle distribution in proportion to how quiet the recent hour has been,
+    and how quiet the last minute is relative to that hour.
     """
     shift = (_MU_KEEP - 1.0) * float(mu_px) + _C1_KEEP * float(c1_px)
-    mixture = np.asarray(ladder, dtype=np.float64) + shift
-    mixture = np.maximum(mixture, _MIN_PRICE)
+    mixture = ladder + shift
+    np.maximum(mixture, _MIN_PRICE, out=mixture)
     np.maximum.accumulate(mixture, out=mixture)
-    weight = _candle_weight(p90, trigger, candle is not None)
+    weight = _candle_weight(p90, trigger, candle is not None, activity)
     if candle is None or weight <= 1e-4:
         return mixture
-    candle_a = np.maximum(np.asarray(candle, dtype=np.float64), _MIN_PRICE)
-    np.maximum.accumulate(candle_a, out=candle_a)
     if weight >= 1.0 - 1e-4:
-        return candle_a
-    return _cdf_mix(candle_a, mixture, weight)
+        return candle
+    return _cdf_mix(candle, mixture, weight)
 
 
 def _forecast_from_parts(
@@ -1140,13 +1133,14 @@ def _forecast_from_parts(
     ofi: float,
     now_ms: int,
     trigger: str,
-    ref_scale: float,
+    hour: _Hour | None = None,
 ) -> np.ndarray:
     """Percentile ladder from features and precomputed book/candle summaries."""
     global last_mu_px, last_anchor_px
+    h = hour if hour is not None else _Hour(closes)
     px = max(f["price"], _MIN_PRICE)
-    vol10 = f["vol_1s"] * np.sqrt(float(HORIZON_SECONDS))
-    vol_fast10 = f["vol_fast"] * np.sqrt(float(HORIZON_SECONDS))
+    vol10 = f["vol_1s"] * _SQRT_H
+    vol_fast10 = f["vol_fast"] * _SQRT_H
     rng = max(f["s_rng"], f["f_rng"])
     rv = max(f["s_rv"], f["f_rv"])
 
@@ -1156,32 +1150,24 @@ def _forecast_from_parts(
     mu_px = mu_ret * px
     sigma_px = (_KA * pred_abs + _KB * abs(mu_ret) + _FL) * px
     sigma_px = max(sigma_px, (_FR * rng + _FV * rv) * px)
-    sigma_px = float(np.clip(sigma_px * _SM, _MIN_SIGMA_PX, _MAX_SIGMA_PX))
-    sigma_px = _blend_scale(sigma_px, _realized_mix_scale(closes, px))
-    sigma_px = _vol_aware_scale(sigma_px, closes, px)
-    sigma_px = float(np.clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX))
-    mu_px = float(np.clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px))
-    # Pull a noisy feature-model shift back toward spot before the
-    # liquidation and depth-band adjustments, which are directional.
-    # A loud hour — its own move scale above the model scale — keeps the
-    # shift. A quieter hour pulls a shift that is large next to the model
-    # scale back toward spot.
-    if not (float(ref_scale) > sigma_px):
-        mu_px = _reliable_shift(mu_px, sigma_px)
+    sigma_px = _clip(sigma_px * _SM, _MIN_SIGMA_PX, _MAX_SIGMA_PX)
+    sigma_px = _blend_scale(sigma_px, h.realized_mix(px))
+    sigma_px = h.vol_aware(sigma_px, px)
+    sigma_px = _clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX)
+    mu_px = _clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px)
     # input.md: a buy liquidation pushes price up; depth bands must be
     # re-anchored to the live mid before they can shift the book.
     mu_px += (_LIQ_K * f["liq_dir"] + _BAND_K * f["band_imb"]) * sigma_px
     sigma_px *= 1.0 + 0.20 * max(f["liq_hour"], 0.0)
-    sigma_px = float(np.clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX))
-    sigma_px = _regime_scale(sigma_px, closes)
-    sigma_px = float(np.clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX))
-    mu_px = float(np.clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px))
-    mu_px, sigma_px = _flex_linear(mu_px, sigma_px, closes)
-    sigma_px = float(np.clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX))
-    mu_px = float(np.clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px))
+    sigma_px = _clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX)
+    sigma_px = _regime_scale(sigma_px, closes, h)
+    sigma_px = _clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX)
+    mu_px = _clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px)
+    mu_px, sigma_px = _flex_linear(mu_px, sigma_px, closes, h)
+    sigma_px = _clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX)
+    mu_px = _clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px)
     sigma_px = _season_scale(sigma_px, px, now_ms)
-    sigma_px = float(np.clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX))
-    mu_px = _season_location(mu_px, now_ms, f["momentum"])
+    sigma_px = _clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX)
     mu_px += _OFI_K * float(ofi) * sigma_px
     # Spot and futures top-of-book imbalance. On the prompts where the next
     # move is large, this sign is right about four times in five, and the
@@ -1189,9 +1175,7 @@ def _forecast_from_parts(
     imb = 0.5 * (float(f["s_imb"]) + float(f["f_imb"]))
     imb_k = _IMB_EVENT if trigger != "time" else _IMB_K
     mu_px += imb_k * imb * sigma_px
-    if trigger != "time":
-        sigma_px = float(np.clip(sigma_px * _EVENT_SIGMA, _MIN_SIGMA_PX, _MAX_SIGMA_PX))
-    mu_px = float(np.clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px))
+    mu_px = _clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px)
     book_cap, book_pivot, book_slope = _season_book(now_ms)
     hist_w = _HIST_W
     if abs(imb) >= _LOUD_IMB:
@@ -1207,25 +1191,57 @@ def _forecast_from_parts(
         book_slope=book_slope,
         offsets=offsets,
     )
-    ratio = _hist_jump_ratio(closes)
-    if offsets is not None and hist_w > 0.0 and (
-        closes.size < 50 or ratio < _HIST_JUMP
-    ):
+    ratio = h.jump_ratio()
+    if offsets is not None and hist_w > 0.0 and (h.n < 50 or ratio < _HIST_JUMP):
         ladder = (1.0 - hist_w) * ladder + hist_w * (px + offsets)
-        ladder = _sanitize(ladder)
     elif ratio >= _HIST_JUMP:
         med = 0.5 * (float(ladder[49]) + float(ladder[50]))
         ladder = ladder.copy()
         ladder[8:92] = med + _CALM_CORE * (ladder[8:92] - med)
-        ladder = _sanitize(ladder)
-    bins = _candle_abs_bins(closes)
+    bins, p90, activity = h.candle_parts(px)
     candle = None if bins is None else _skewed_candle_prices(px, bins, mu_px)
-    p90 = _move_p90_usd(closes, px)
     c1_px = float(f["c1"]) * px
-    mixed = _combine(ladder, candle, mu_px, c1_px, p90, trigger)
+    mixed = _combine(ladder, candle, mu_px, c1_px, p90, trigger, activity)
+    if trigger != "time":
+        mixed = _widen_event_center(mixed)
     last_mu_px = float(mu_px)
     last_anchor_px = float(px)
     return mixed
+
+
+# Futures taker flow in the last second leads spot after a trade print. One
+# standard deviation of that flow (5.6 BTC on the saved trade-triggered
+# prompts) moves the forecast by this fraction of its width; the flow is
+# clipped at four deviations. Both halves of the saved prompts improved.
+_FLOW_K = 0.10
+_FLOW_SD = 5.644958570072203
+_FLOW_CLIP = 4.0
+_FLOW_MS = 1000
+
+
+def _flow_shift(q: np.ndarray, fut: dict | None, now_ms: int) -> np.ndarray:
+    """Shift a trade-triggered forecast along the last second of futures taker flow."""
+    flow = taker_flow((fut or {}).get("trades"), now_ms, _FLOW_MS)
+    z = _clip(flow / _FLOW_SD, -_FLOW_CLIP, _FLOW_CLIP)
+    if not (z != 0.0) or not math.isfinite(z):
+        return q
+    med = 0.5 * (float(q[49]) + float(q[50]))
+    width = float(np.abs(q - med).sum()) / NUM_PERCENTILES
+    return q + _FLOW_K * z * width
+
+
+def _fallback(payload: dict) -> np.ndarray:
+    """Wide mixture around the last quote so a degraded path is not overconfident."""
+    global last_mu_px, last_anchor_px
+    px = _MIN_PRICE
+    try:
+        venues = (payload or {}).get("venues") or {}
+        px = max(reference_price(venues.get("spot"), venues.get("futures")), _MIN_PRICE)
+    except Exception:
+        px = _MIN_PRICE
+    last_mu_px = 0.0
+    last_anchor_px = float(px)
+    return _ladder(px, 0.0, max(8.0, 1e-4 * px))
 
 
 def predict_percentiles(payload: dict) -> np.ndarray:
@@ -1241,9 +1257,10 @@ def predict_percentiles(payload: dict) -> np.ndarray:
     last_mu_px = float("nan")
     last_anchor_px = float("nan")
     try:
-        f = extract(payload)
+        prompt = payload.get("prompt") or {}
         venues = payload.get("venues") or {}
         spot = venues.get("spot") or {}
+        f = extract(payload)
         closes = _venue_closes(spot)
         book = spot.get("book_ticker")
         # No spot book and no spot hour: the futures candles are the only
@@ -1253,56 +1270,120 @@ def predict_percentiles(payload: dict) -> np.ndarray:
             fut_closes = _venue_closes(venues.get("futures") or {})
             if fut_closes.size >= 40:
                 closes = fut_closes
-        now_ms = int((payload.get("prompt") or {}).get("current_time_ms") or 0)
-        trigger = str(((payload.get("prompt") or {}).get("trigger") or {}).get("kind") or "time")
-        return _forecast_from_parts(
+        hour = _Hour(closes)
+        now_ms = int(prompt.get("current_time_ms") or 0)
+        trigger = str((prompt.get("trigger") or {}).get("kind") or "time")
+        out = _forecast_from_parts(
             f,
             closes,
             _book_offsets(book),
             _quote_ofi(book),
             now_ms,
             trigger,
-            _raw_reference_scale(payload),
+            hour,
         )
+        if _valid(out):
+            try:
+                out = _post_layers(out, payload, f, closes, now_ms, trigger)
+            except Exception:
+                pass
+            return out
     except Exception:
-        px = _MIN_PRICE
-        try:
-            venues = (payload or {}).get("venues") or {}
-            px = max(reference_price(venues.get("spot"), venues.get("futures")), _MIN_PRICE)
-        except Exception:
-            px = _MIN_PRICE
-        # Wide mixture fallback so a degraded path is not overconfident.
-        last_mu_px = 0.0
-        last_anchor_px = float(px)
-        return _ladder(px, 0.0, max(8.0, 1e-4 * px))
+        pass
+    return _fallback(payload)
+
+
+def _valid(out: np.ndarray) -> bool:
+    return out.shape == (NUM_PERCENTILES,) and out[0] > 0.0 and math.isfinite(float(out.sum()))
+
+
+def _post_layers(
+    out: np.ndarray, payload: dict, f: dict[str, float], closes: np.ndarray, now_ms: int, trigger: str
+) -> np.ndarray:
+    """Futures-flow shift and the stillness point mass. A bad result keeps ``out``."""
+    event = trigger != "time"
+    q = out
+    if event:
+        q = _flow_shift(q, (payload.get("venues") or {}).get("futures"), now_ms)
+    seas = float(_SEAS_ABS[_slot_index(now_ms)]) if now_ms >= 0 else 0.0
+    x = still_features(payload, closes, now_ms, seas, 0.0)
+    q = apply_stillness(q, max(f["price"], _MIN_PRICE), x, event)
+    return q if _valid(q) else out
+
+
+def _warmup_payload(trigger: str) -> dict:
+    """A full-size synthetic hour, so every array path is primed before scoring."""
+    rng = np.random.default_rng(7)
+    now = 1_790_000_000_000
+    n = 3600
+    close = 80_000.0 * np.exp(np.cumsum(rng.normal(0.0, 4e-5, n)))
+    ohlcv = np.stack([close, close + 1.0, close - 1.0, close, rng.uniform(0.1, 3.0, n)], axis=1)
+    candles = {
+        "open_time_ms": now - 1000 * np.arange(n, 0, -1, dtype=np.int64),
+        "ohlcv": ohlcv,
+        "complete_history": True,
+    }
+    k = 4000
+    recv = np.linspace(now - 59_900, now, k).astype(np.int64)
+    mid = close[-1] + np.cumsum(rng.normal(0.0, 0.3, k))
+    book = {
+        "recv_ts_ms": recv,
+        "bid_price": mid - 0.005,
+        "bid_qty": rng.uniform(0.1, 5.0, k),
+        "ask_price": mid + 0.005,
+        "ask_qty": rng.uniform(0.1, 5.0, k),
+    }
+    m = 600
+    trades = {
+        "ts_ms": np.linspace(now - 59_000, now, m).astype(np.int64),
+        "event_ts_ms": np.linspace(now - 59_000, now, m).astype(np.int64),
+        "recv_ts_ms": np.linspace(now - 59_000, now, m).astype(np.int64),
+        "price": mid[-m:],
+        "qty": rng.uniform(0.001, 1.0, m),
+        "buyer_is_maker": rng.random(m) < 0.5,
+    }
+    levels = np.arange(1.0, 21.0)
+    depth = {
+        "recv_ts_ms": now - 100,
+        "bids": np.stack([mid[-1] - levels, rng.uniform(0.1, 3.0, 20)], axis=1),
+        "asks": np.stack([mid[-1] + levels, rng.uniform(0.1, 3.0, 20)], axis=1),
+    }
+    venue = {
+        "candles_1s": candles,
+        "trades": trades,
+        "book_ticker": book,
+        "depth_latest": depth,
+        "last_event_times": {"trade": now, "bookTicker": now},
+    }
+    spot = dict(venue)
+    spot["depth_bands"] = {
+        "anchor_price": float(mid[-1]),
+        "bucket_usd": 10.0,
+        "bids": rng.uniform(0.5, 5.0, 100),
+        "asks": rng.uniform(0.5, 5.0, 100),
+        "recv_ts_ms": now - 5_000,
+    }
+    fut = dict(venue)
+    fut["liquidations"] = {
+        "recv_ts_ms": np.array([now - 5_000, now - 600_000], dtype=np.int64),
+        "price": np.array([mid[-1], mid[-1]]),
+        "qty": np.array([0.2, 0.5]),
+        "is_buy": np.array([True, False]),
+    }
+    return {
+        "schema_version": 5,
+        "prompt": {"current_time_ms": now, "trigger": {"kind": trigger, "venue": None}},
+        "venues": {"spot": spot, "futures": fut},
+    }
 
 
 def _import_warmup() -> None:
     """Prime numpy paths at import. Synth does not count this against the 5 ms budget."""
-    predict_percentiles(
-        {
-            "schema_version": 5,
-            "prompt": {"current_time_ms": 1_000},
-            "venues": {
-                "spot": {
-                    "depth_bands": {
-                        "anchor_price": 100.0,
-                        "bucket_usd": 10.0,
-                        "bids": np.ones(16, dtype=np.float64),
-                        "asks": np.ones(16, dtype=np.float64),
-                        "recv_ts_ms": 500,
-                    }
-                },
-                "futures": {
-                    "liquidations": {
-                        "recv_ts_ms": np.array([500], dtype=np.int64),
-                        "qty": np.array([0.2], dtype=np.float64),
-                        "is_buy": np.array([True]),
-                    }
-                },
-            },
-        }
-    )
+    for trigger in ("time", "event"):
+        payload = _warmup_payload(trigger)
+        for _ in range(3):
+            predict_percentiles(payload)
+    predict_percentiles({"prompt": {"current_time_ms": 1_000}, "venues": {}})
     # Automatic GC pauses are a common source of multi-ms latency spikes.
     gc.collect()
     gc.disable()
