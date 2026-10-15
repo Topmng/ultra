@@ -6,6 +6,7 @@ the CRPS-tuned location/scale model.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -425,6 +426,85 @@ def last_event_age_ms(venue: dict | None, now_ms: int) -> float:
     return float(max(0, int(now_ms) - max(vals)))
 
 
+def _top_px(levels: Any) -> float:
+    """Best price on one depth side, or 0 when that side is missing."""
+    if levels is None:
+        return 0.0
+    arr = levels if isinstance(levels, np.ndarray) else np.asarray(levels, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] < 1:
+        return 0.0
+    px = float(arr[0, 0])
+    return px if math.isfinite(px) and px > 0.0 else 0.0
+
+
+def _depth_mid(snapshot: dict | None) -> float:
+    """Mid of the best depth quote. The book ticker is not the only top of book."""
+    if not snapshot:
+        return 0.0
+    bid = _top_px(snapshot.get("bids"))
+    ask = _top_px(snapshot.get("asks"))
+    if bid > 0.0 and ask > 0.0:
+        return 0.5 * (bid + ask)
+    return bid if bid > 0.0 else ask
+
+
+def _last_trade_px(trades: dict | None) -> float:
+    if not trades:
+        return 0.0
+    px = trades.get("price")
+    if px is None:
+        return 0.0
+    arr = px if isinstance(px, np.ndarray) else np.asarray(px, dtype=np.float64)
+    if arr.size == 0:
+        return 0.0
+    last = float(arr.reshape(-1)[-1])
+    return last if math.isfinite(last) and last > 0.0 else 0.0
+
+
+def _last_close(venue: dict | None) -> float:
+    close = _close_tail(venue, 1)
+    if close.size == 0:
+        return 0.0
+    last = float(close[-1])
+    return last if math.isfinite(last) and last > 0.0 else 0.0
+
+
+def reference_price(spot: dict | None, fut: dict | None) -> float:
+    """Spot microprice, or the next quote that sits on the same scale.
+
+    The scored price is the spot book. When that tape and the spot candles
+    are empty, depth, the futures book, and the futures closes still name
+    the market. A stand-in of 1 is used only when none of those exist.
+    A candidate more than a factor of two from the candle close is a bad tick.
+    """
+    spot = spot or {}
+    fut = fut or {}
+    spot_micro, spot_mid, _ = last_book_micro(spot.get("book_ticker"))
+    fut_micro, fut_mid, _ = last_book_micro(fut.get("book_ticker"))
+    spot_close = _last_close(spot)
+    fut_close = _last_close(fut)
+    ref = spot_close if spot_close > 0.0 else fut_close
+    candidates = (
+        spot_micro,
+        spot_mid,
+        fut_micro,
+        fut_mid,
+        _depth_mid(spot.get("depth_latest")),
+        _depth_mid(fut.get("depth_latest")),
+        spot_close,
+        fut_close,
+        _last_trade_px(spot.get("trades")),
+        _last_trade_px(fut.get("trades")),
+    )
+    for px in candidates:
+        if not math.isfinite(px) or px <= 0.0:
+            continue
+        if ref > 0.0 and abs(math.log(px / ref)) > math.log(2.0):
+            continue
+        return float(px)
+    return ref if ref > 0.0 else 1.0
+
+
 def extract(payload: dict) -> dict[str, float]:
     prompt = payload.get("prompt") or {}
     venues = payload.get("venues") or {}
@@ -476,9 +556,7 @@ def extract(payload: dict) -> dict[str, float]:
     s_bt = book_ticker_stats(spot.get("book_ticker"))
     f_bt = book_ticker_stats(fut.get("book_ticker"))
 
-    px = spot_micro if spot_micro > 0.0 else (spot_mid if spot_mid > 0.0 else fut_micro)
-    if px <= 0.0:
-        px = float(close[-1]) if close.size else 1.0
+    px = reference_price(spot, fut)
 
     ref = spot_mid if spot_mid > 0.0 else px
     band_imb = depth_band_imbalance(spot.get("depth_bands"), ref, now_ms)

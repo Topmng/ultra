@@ -18,7 +18,7 @@ import gc
 import numpy as np
 
 from synth_ultra.constants import HORIZON_SECONDS, NUM_PERCENTILES
-from synth_ultra.features import extract
+from synth_ultra.features import extract, reference_price
 from synth_ultra.season_table import SEAS_ABS as _SEAS_ABS
 from synth_ultra.season_table import SEAS_AC as _SEAS_AC
 from synth_ultra.season_table import SEAS_JUMP as _SEAS_JUMP
@@ -1242,9 +1242,18 @@ def predict_percentiles(payload: dict) -> np.ndarray:
     last_anchor_px = float("nan")
     try:
         f = extract(payload)
-        closes = _spot_closes(payload)
+        venues = payload.get("venues") or {}
+        spot = venues.get("spot") or {}
+        closes = _venue_closes(spot)
+        book = spot.get("book_ticker")
+        # No spot book and no spot hour: the futures candles are the only
+        # 10-second history. A live spot book keeps the old empty-candle path.
+        book_ts = None if not book else book.get("recv_ts_ms")
+        if closes.size < 40 and (book_ts is None or len(book_ts) == 0):
+            fut_closes = _venue_closes(venues.get("futures") or {})
+            if fut_closes.size >= 40:
+                closes = fut_closes
         now_ms = int((payload.get("prompt") or {}).get("current_time_ms") or 0)
-        book = ((payload.get("venues") or {}).get("spot") or {}).get("book_ticker")
         trigger = str(((payload.get("prompt") or {}).get("trigger") or {}).get("kind") or "time")
         return _forecast_from_parts(
             f,
@@ -1259,22 +1268,7 @@ def predict_percentiles(payload: dict) -> np.ndarray:
         px = _MIN_PRICE
         try:
             venues = (payload or {}).get("venues") or {}
-            spot = venues.get("spot") or {}
-            book = spot.get("book_ticker") or {}
-            bid = book.get("bid_price")
-            ask = book.get("ask_price")
-            if bid is not None and ask is not None and len(bid) and len(ask):
-                bp = float(bid[-1] if not isinstance(bid, np.ndarray) else bid.reshape(-1)[-1])
-                ap = float(ask[-1] if not isinstance(ask, np.ndarray) else ask.reshape(-1)[-1])
-                if np.isfinite(bp) and np.isfinite(ap):
-                    px = max(0.5 * (bp + ap), _MIN_PRICE)
-            if px <= _MIN_PRICE:
-                candles = spot.get("candles_1s") or {}
-                ohlcv = candles.get("ohlcv")
-                if ohlcv is not None:
-                    arr = ohlcv if isinstance(ohlcv, np.ndarray) else np.asarray(ohlcv, dtype=np.float64)
-                    if arr.ndim == 2 and arr.shape[0] and arr.shape[1] >= 4:
-                        px = max(float(arr[-1, 3]), _MIN_PRICE)
+            px = max(reference_price(venues.get("spot"), venues.get("futures")), _MIN_PRICE)
         except Exception:
             px = _MIN_PRICE
         # Wide mixture fallback so a degraded path is not overconfident.
