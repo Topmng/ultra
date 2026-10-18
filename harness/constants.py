@@ -1,35 +1,40 @@
-"""Local schema and scoring constants. Not copied into the miner image.
+"""Local scoring constants. Not copied into the miner image.
 
-Inference only needs ``NUM_PERCENTILES`` and ``HORIZON_SECONDS``, which stay in
-``synth_ultra.constants``.
+The payload contract (windows, assets, trigger kinds) lives in
+``synth_ultra.constants`` and is re-exported here. Quantile grids and the
+latency budget stay local.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from synth_ultra.constants import HORIZON_SECONDS, NUM_PERCENTILES
+from synth_ultra.constants import (
+    ASSETS,
+    BOOK_TICKER_WINDOW_S,
+    BTC_REF_PX,
+    CANDLE_WINDOW_S,
+    CLOCK_INTERVAL_MS,
+    DEPTH_BAND_USD,
+    DEPTH_BANDS,
+    DEPTH_LEVELS,
+    EVENT_DELAY_MAX_MS,
+    EVENT_WINDOW_LEN_MS,
+    EVENT_WINDOW_OPEN_MS,
+    HORIZON_SECONDS,
+    LIQUIDATION_WINDOW_S,
+    NUM_PERCENTILES,
+    SCHEMA_VERSION,
+    TRADE_WINDOW_S,
+    TRIGGER_KINDS,
+    TRIGGER_VENUES,
+    AssetSpec,
+    asset_spec,
+    price_scale,
+)
 
 LATENCY_BUDGET_S = 0.005
 QUANTILE_GRID = (2.0 * np.arange(1, NUM_PERCENTILES + 1) - 1.0) / 200.0
-DEPTH_LEVELS = 20
-CANDLE_WINDOW_S = 3600
-TRADE_WINDOW_S = 60
-BOOK_TICKER_WINDOW_S = 60
-LIQUIDATION_WINDOW_S = 3600
-DEPTH_BANDS = 100
-DEPTH_BAND_USD = 10.0
-# FAQ.md: time prompts on wall-clock :00, :20, :40. The event window opens
-# 10s later and stays open for 5s. Half of the accepted moves are delayed
-# by uniform(0, 500 ms); current_time_ms stays the move's receive time.
-CLOCK_INTERVAL_MS = 20_000
-EVENT_WINDOW_OPEN_MS = 10_000
-EVENT_WINDOW_LEN_MS = 5_000
-EVENT_DELAY_MAX_MS = 500
-SCHEMA_VERSION = 5
-# input.md: prompt.trigger.kind. `venue` is None on a clock trigger.
-TRIGGER_KINDS = ("time", "event", "event_delayed")
-TRIGGER_VENUES = ("spot", "futures")
 # SPECIFICATION.md drops a prompt when the spot book is not live around the
 # target instant. The feed normally updates many times per second (FAQ.md),
 # so a gap longer than this means that instant has no live book.
@@ -100,7 +105,10 @@ _U = QUANTILE_GRID - 0.5
 LAPLACE_Z = -np.sign(_U) * np.log(np.maximum(1.0 - 2.0 * np.abs(_U), 1e-12))
 
 __all__ = [
+    "ASSETS",
+    "AssetSpec",
     "BOOK_TICKER_WINDOW_S",
+    "BTC_REF_PX",
     "CANDLE_WINDOW_S",
     "CLOCK_INTERVAL_MS",
     "DEPTH_BAND_USD",
@@ -116,6 +124,8 @@ __all__ = [
     "LIQUIDATION_WINDOW_S",
     "NUM_PERCENTILES",
     "QUANTILE_GRID",
+    "asset_spec",
+    "price_scale",
     "SCHEMA_VERSION",
     "SPOT_FEED_LIVE_MS",
     "TRADE_WINDOW_S",

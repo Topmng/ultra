@@ -1,4 +1,4 @@
-"""BTC 10s percentile forecast. Target: <5 ms, CPU-only, deterministic.
+"""10s percentile forecast for BTC, ETH, SOL, and XRP. Target: <5 ms, CPU-only, deterministic.
 
 Two distributions are built from the payload. The mixture ladder keeps wide
 tails for jumps. The candle bins, from the last 30 minutes of 10-second log
@@ -26,7 +26,7 @@ import math
 
 import numpy as np
 
-from synth_ultra.constants import HORIZON_SECONDS, NUM_PERCENTILES
+from synth_ultra.constants import HORIZON_SECONDS, NUM_PERCENTILES, price_scale
 from synth_ultra.features import extract, reference_price
 from synth_ultra.season_table import SEAS_ABS as _SEAS_ABS
 from synth_ultra.season_table import SEAS_REL as _SEAS_REL
@@ -381,7 +381,7 @@ class _Hour:
             return 0.0
         return px * mean_abs / _Z_ABS
 
-    def vol_aware(self, fitted: float, px: float) -> float:
+    def vol_aware(self, fitted: float, px: float, log_floor: float = 0.3) -> float:
         """Log-blend the fitted scale with EWMA 10s moves, 60s vol and the 10s range."""
         if self.a10 is None or not math.isfinite(fitted) or fitted <= 0.0:
             return fitted
@@ -400,7 +400,7 @@ class _Hour:
         hl10 = px * math.log(hi / lo) / _Z_ABS if lo > 0.0 and hi > lo else fast
         acc = _VOL_LOG_BIAS
         for w, v in zip(_VOL_W, (fitted, fast, rv60, hl10)):
-            acc += w * math.log(max(v, 0.3))
+            acc += w * math.log(max(v, log_floor))
         return math.exp(acc)
 
     def recent_mad(self, n: int) -> float:
@@ -1134,11 +1134,15 @@ def _forecast_from_parts(
     now_ms: int,
     trigger: str,
     hour: _Hour | None = None,
+    asset: str = "BTC",
 ) -> np.ndarray:
     """Percentile ladder from features and precomputed book/candle summaries."""
     global last_mu_px, last_anchor_px
     h = hour if hour is not None else _Hour(closes)
     px = max(f["price"], _MIN_PRICE)
+    scale = price_scale(asset, px)
+    lo = _MIN_SIGMA_PX * scale
+    hi = _MAX_SIGMA_PX * scale
     vol10 = f["vol_1s"] * _SQRT_H
     vol_fast10 = f["vol_fast"] * _SQRT_H
     rng = max(f["s_rng"], f["f_rng"])
@@ -1150,24 +1154,24 @@ def _forecast_from_parts(
     mu_px = mu_ret * px
     sigma_px = (_KA * pred_abs + _KB * abs(mu_ret) + _FL) * px
     sigma_px = max(sigma_px, (_FR * rng + _FV * rv) * px)
-    sigma_px = _clip(sigma_px * _SM, _MIN_SIGMA_PX, _MAX_SIGMA_PX)
+    sigma_px = _clip(sigma_px * _SM, lo, hi)
     sigma_px = _blend_scale(sigma_px, h.realized_mix(px))
-    sigma_px = h.vol_aware(sigma_px, px)
-    sigma_px = _clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX)
+    sigma_px = h.vol_aware(sigma_px, px, log_floor=0.3 * scale)
+    sigma_px = _clip(sigma_px, lo, hi)
     mu_px = _clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px)
     # input.md: a buy liquidation pushes price up; depth bands must be
     # re-anchored to the live mid before they can shift the book.
     mu_px += (_LIQ_K * f["liq_dir"] + _BAND_K * f["band_imb"]) * sigma_px
     sigma_px *= 1.0 + 0.20 * max(f["liq_hour"], 0.0)
-    sigma_px = _clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX)
+    sigma_px = _clip(sigma_px, lo, hi)
     sigma_px = _regime_scale(sigma_px, closes, h)
-    sigma_px = _clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX)
+    sigma_px = _clip(sigma_px, lo, hi)
     mu_px = _clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px)
     mu_px, sigma_px = _flex_linear(mu_px, sigma_px, closes, h)
-    sigma_px = _clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX)
+    sigma_px = _clip(sigma_px, lo, hi)
     mu_px = _clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px)
     sigma_px = _season_scale(sigma_px, px, now_ms)
-    sigma_px = _clip(sigma_px, _MIN_SIGMA_PX, _MAX_SIGMA_PX)
+    sigma_px = _clip(sigma_px, lo, hi)
     mu_px += _OFI_K * float(ofi) * sigma_px
     # Spot and futures top-of-book imbalance. On the prompts where the next
     # move is large, this sign is right about four times in five, and the
@@ -1219,10 +1223,12 @@ _FLOW_CLIP = 4.0
 _FLOW_MS = 1000
 
 
-def _flow_shift(q: np.ndarray, fut: dict | None, now_ms: int) -> np.ndarray:
+def _flow_shift(
+    q: np.ndarray, fut: dict | None, now_ms: int, flow_sd: float = _FLOW_SD
+) -> np.ndarray:
     """Shift a trade-triggered forecast along the last second of futures taker flow."""
     flow = taker_flow((fut or {}).get("trades"), now_ms, _FLOW_MS)
-    z = _clip(flow / _FLOW_SD, -_FLOW_CLIP, _FLOW_CLIP)
+    z = _clip(flow / flow_sd, -_FLOW_CLIP, _FLOW_CLIP)
     if not (z != 0.0) or not math.isfinite(z):
         return q
     med = 0.5 * (float(q[49]) + float(q[50]))
@@ -1241,11 +1247,12 @@ def _fallback(payload: dict) -> np.ndarray:
         px = _MIN_PRICE
     last_mu_px = 0.0
     last_anchor_px = float(px)
-    return _ladder(px, 0.0, max(8.0, 1e-4 * px))
+    asset = str(((payload or {}).get("prompt") or {}).get("asset") or "BTC")
+    return _ladder(px, 0.0, max(8.0 * price_scale(asset, px), 1e-4 * px))
 
 
 def predict_percentiles(payload: dict) -> np.ndarray:
-    """Return 100 centered-quantile prices for BTC 10s ahead.
+    """Return 100 centered-quantile prices for the prompted asset, 10s ahead.
 
     Output constraints (SPECIFICATION.md): shape (100,), float64, finite,
     strictly positive, non-decreasing. Quantile grid q_i = (2i-1)/200.
@@ -1273,6 +1280,7 @@ def predict_percentiles(payload: dict) -> np.ndarray:
         hour = _Hour(closes)
         now_ms = int(prompt.get("current_time_ms") or 0)
         trigger = str((prompt.get("trigger") or {}).get("kind") or "time")
+        asset = str(prompt.get("asset") or "BTC")
         out = _forecast_from_parts(
             f,
             closes,
@@ -1281,10 +1289,11 @@ def predict_percentiles(payload: dict) -> np.ndarray:
             now_ms,
             trigger,
             hour,
+            asset,
         )
         if _valid(out):
             try:
-                out = _post_layers(out, payload, f, closes, now_ms, trigger)
+                out = _post_layers(out, payload, f, closes, now_ms, trigger, asset)
             except Exception:
                 pass
             return out
@@ -1298,16 +1307,29 @@ def _valid(out: np.ndarray) -> bool:
 
 
 def _post_layers(
-    out: np.ndarray, payload: dict, f: dict[str, float], closes: np.ndarray, now_ms: int, trigger: str
+    out: np.ndarray,
+    payload: dict,
+    f: dict[str, float],
+    closes: np.ndarray,
+    now_ms: int,
+    trigger: str,
+    asset: str = "BTC",
 ) -> np.ndarray:
     """Futures-flow shift and the stillness point mass. A bad result keeps ``out``."""
     event = trigger != "time"
     q = out
+    anchor = max(f["price"], _MIN_PRICE)
+    scale = price_scale(asset, anchor)
     if event:
-        q = _flow_shift(q, (payload.get("venues") or {}).get("futures"), now_ms)
+        q = _flow_shift(
+            q,
+            (payload.get("venues") or {}).get("futures"),
+            now_ms,
+            flow_sd=_FLOW_SD / scale,
+        )
     seas = float(_SEAS_ABS[_slot_index(now_ms)]) if now_ms >= 0 else 0.0
-    x = still_features(payload, closes, now_ms, seas, 0.0)
-    q = apply_stillness(q, max(f["price"], _MIN_PRICE), x, event)
+    x = still_features(payload, closes, now_ms, seas, 0.0, asset=asset)
+    q = apply_stillness(q, anchor, x, event, asset=asset)
     return q if _valid(q) else out
 
 

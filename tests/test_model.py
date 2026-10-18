@@ -359,3 +359,60 @@ def test_ten_second_bins_keep_flat_candles_on_the_anchor_and_skew_with_mu():
     assert bins.shape == (50,)
     assert np.sum(bins == 0.0) >= 40
     assert _candle_abs_bins(np.full(30, 50_000.0)) is None
+
+
+@pytest.mark.parametrize(
+    ("name", "asset", "symbol", "bucket", "slot_mod"),
+    [
+        ("samples/real_payload.json", "BTC", "BTCUSDT", 10.0, None),
+        ("samples/real_payload_ETH.json", "ETH", "ETHUSDT", 0.5, 5_000),
+        ("samples/real_payload_SOL.json", "SOL", "SOLUSDT", 0.03, 10_000),
+        ("samples/real_payload_XRP.json", "XRP", "XRPUSDT", 0.0003, 15_000),
+    ],
+)
+def test_real_asset_payloads(name, asset, symbol, bucket, slot_mod):
+    path = Path(name)
+    if not path.is_file():
+        pytest.skip(f"{name} is not present")
+    payload = load_payload(path)
+    assert_payload_schema(payload)
+    assert payload["prompt"]["asset"] == asset
+    assert payload["venues"]["spot"]["symbol"] == symbol
+    assert payload["venues"]["futures"]["symbol"] == symbol
+    assert float(payload["venues"]["spot"]["depth_bands"]["bucket_usd"]) == pytest.approx(bucket)
+    assert float(payload["venues"]["futures"]["depth_bands"]["bucket_usd"]) == pytest.approx(bucket)
+    now = int(payload["prompt"]["current_time_ms"])
+    if slot_mod is not None:
+        assert now % 20_000 == slot_mod
+    out = check_output(predict_percentiles(payload))
+    book = payload["venues"]["spot"]["book_ticker"]
+    micro = spot_microprice(
+        float(book["bid_price"][-1]),
+        float(book["bid_qty"][-1]),
+        float(book["ask_price"][-1]),
+        float(book["ask_qty"][-1]),
+    )
+    med = 0.5 * (float(out[49]) + float(out[50]))
+    assert abs(med - micro) / micro < 0.02
+    mad = float(np.mean(np.abs(out - med)))
+    assert mad / micro < 0.02
+
+
+@pytest.mark.parametrize(
+    ("asset", "symbol", "bucket"),
+    [("ETH", "ETHUSDT", 0.5), ("SOL", "SOLUSDT", 0.03), ("XRP", "XRPUSDT", 0.0003)],
+)
+def test_sample_payload_covers_each_asset(asset, symbol, bucket):
+    payload = make_sample_payload(0, compact=True, current_time_ms=1_700_000_000_000, asset=asset)
+    assert_payload_schema(payload)
+    assert payload["venues"]["spot"]["symbol"] == symbol
+    assert float(payload["venues"]["spot"]["depth_bands"]["bucket_usd"]) == pytest.approx(bucket)
+    assert float(payload["venues"]["futures"]["depth_bands"]["bucket_usd"]) == pytest.approx(bucket)
+    check_output(predict_percentiles(payload))
+
+
+def test_unknown_asset_fails_schema():
+    payload = make_sample_payload(0, compact=True, current_time_ms=1_700_000_000_000)
+    payload["prompt"]["asset"] = "DOGE"
+    with pytest.raises(ValueError, match="prompt.asset"):
+        assert_payload_schema(payload)

@@ -21,6 +21,7 @@ from synth_ultra.constants import (
     TRADE_WINDOW_S,
     TRIGGER_KINDS,
     TRIGGER_VENUES,
+    asset_spec,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -80,11 +81,11 @@ def empty_liquidations() -> dict:
     }
 
 
-def empty_depth_bands() -> dict:
+def empty_depth_bands(bucket_usd: float = DEPTH_BAND_USD) -> dict:
     """No snapshot yet: recv_ts_ms 0 and zero-length sides (input.md)."""
     return {
         "anchor_price": 0.0,
-        "bucket_usd": float(DEPTH_BAND_USD),
+        "bucket_usd": float(bucket_usd),
         "bids": np.array([], dtype=np.float64),
         "asks": np.array([], dtype=np.float64),
         "recv_ts_ms": 0,
@@ -163,11 +164,17 @@ def _trades(n: int, t0: int, px: float, rng: np.random.Generator) -> dict:
 
 
 def _book_ticker(
-    n: int, t0: int, px: float, rng: np.random.Generator, *, futures: bool
+    n: int,
+    t0: int,
+    px: float,
+    rng: np.random.Generator,
+    *,
+    futures: bool,
+    usd_scale: float = 1.0,
 ) -> dict:
     recv = np.linspace(t0 + 1, t0 + BOOK_TICKER_WINDOW_S * 1000, n, dtype=np.int64)
     mid = px * np.exp(np.cumsum(rng.normal(0.0, 8e-6, size=n)))
-    half = 0.5 * rng.uniform(0.5, 2.5, size=n)
+    half = 0.5 * rng.uniform(0.5, 2.5, size=n) * float(usd_scale)
     bid_p = mid - half
     ask_p = mid + half
     bid_q = rng.uniform(0.05, 3.0, size=n)
@@ -185,8 +192,10 @@ def _book_ticker(
     return out
 
 
-def _book_side(px: float, rng: np.random.Generator, *, bids: bool) -> np.ndarray:
-    step = rng.uniform(0.5, 2.0, size=DEPTH_LEVELS)
+def _book_side(
+    px: float, rng: np.random.Generator, *, bids: bool, usd_scale: float = 1.0
+) -> np.ndarray:
+    step = rng.uniform(0.5, 2.0, size=DEPTH_LEVELS) * float(usd_scale)
     if bids:
         prices = px - np.cumsum(step)
     else:
@@ -195,19 +204,28 @@ def _book_side(px: float, rng: np.random.Generator, *, bids: bool) -> np.ndarray
     return np.stack([prices, qty], axis=1).astype(np.float64)
 
 
-def _depth_snapshot(t_ms: int, px: float, rng: np.random.Generator, *, futures: bool) -> dict:
+def _depth_snapshot(
+    t_ms: int, px: float, rng: np.random.Generator, *, futures: bool, usd_scale: float = 1.0
+) -> dict:
     return {
         "recv_ts_ms": np.int64(t_ms),
         "update_id": int(rng.integers(1_000_000, 9_000_000)),
-        "bids": _book_side(px, rng, bids=True),
-        "asks": _book_side(px, rng, bids=False),
+        "bids": _book_side(px, rng, bids=True, usd_scale=usd_scale),
+        "asks": _book_side(px, rng, bids=False, usd_scale=usd_scale),
         "event_ts_ms": int(t_ms - 1) if futures else None,
         "transaction_ts_ms": int(t_ms - 2) if futures else None,
     }
 
 
 def _depth_updates(
-    n: int, t0: int, px: float, rng: np.random.Generator, *, futures: bool, start_id: int
+    n: int,
+    t0: int,
+    px: float,
+    rng: np.random.Generator,
+    *,
+    futures: bool,
+    start_id: int,
+    usd_scale: float = 1.0,
 ) -> list[dict]:
     updates = []
     uid = start_id
@@ -223,8 +241,8 @@ def _depth_updates(
             "first_id": int(first),
             "final_id": int(final),
             "prev_final_id": int(first - 1),
-            "bids": _book_side(px, rng, bids=True)[: rng.integers(1, 6)],
-            "asks": _book_side(px, rng, bids=False)[: rng.integers(1, 6)],
+            "bids": _book_side(px, rng, bids=True, usd_scale=usd_scale)[: rng.integers(1, 6)],
+            "asks": _book_side(px, rng, bids=False, usd_scale=usd_scale)[: rng.integers(1, 6)],
         }
         if futures:
             u["transaction_ts_ms"] = np.int64(recv - 2)
@@ -239,6 +257,7 @@ def _liquidations(
     rng: np.random.Generator,
     *,
     futures: bool,
+    usd_scale: float = 1.0,
 ) -> dict:
     """Trailing hour of forced closes. ``is_buy`` is the order side.
 
@@ -253,7 +272,7 @@ def _liquidations(
         n,
         dtype=np.int64,
     )
-    price = px + rng.normal(0.0, 4.0, size=n)
+    price = px + rng.normal(0.0, 4.0 * float(usd_scale), size=n)
     qty = rng.uniform(0.001, 0.3, size=n)
     is_buy = rng.random(n) < 0.5
     return {
@@ -271,14 +290,16 @@ def _depth_bands(
     current_time_ms: int,
     *,
     futures: bool,
+    bucket_usd: float = DEPTH_BAND_USD,
+    usd_scale: float = 1.0,
 ) -> dict:
     """Spot-only coarse book. Anchor is a past mid, not the live price."""
     if futures:
-        return empty_depth_bands()
-    anchor = float(px) - 35.0
+        return empty_depth_bands(bucket_usd)
+    anchor = float(px) - 35.0 * float(usd_scale)
     return {
         "anchor_price": anchor,
-        "bucket_usd": float(DEPTH_BAND_USD),
+        "bucket_usd": float(bucket_usd),
         "bids": rng.uniform(0.05, 3.0, size=DEPTH_BANDS).astype(np.float64),
         "asks": rng.uniform(0.05, 3.0, size=DEPTH_BANDS).astype(np.float64),
         "recv_ts_ms": int(current_time_ms) - 15_000,
@@ -294,6 +315,9 @@ def _venue(
     futures: bool,
     complete_candles: bool,
     compact: bool = False,
+    symbol: str = "BTCUSDT",
+    bucket_usd: float = DEPTH_BAND_USD,
+    usd_scale: float = 1.0,
 ) -> dict:
     n_trades = 6 if compact else (400 if futures else 350)
     n_bt = 8 if compact else (800 if futures else 700)
@@ -309,12 +333,14 @@ def _venue(
         compact=compact,
     )
     trades = _trades(n_trades, t0, px, rng)
-    book_ticker = _book_ticker(n_bt, t0, px, rng, futures=futures)
+    book_ticker = _book_ticker(n_bt, t0, px, rng, futures=futures, usd_scale=usd_scale)
     if candles["ohlcv"].size:
         px = float(candles["ohlcv"][-1, 3])
-    start = _depth_snapshot(t0, px, rng, futures=futures)
-    latest = _depth_snapshot(current_time_ms, px, rng, futures=futures)
-    updates = _depth_updates(n_upd, t0, px, rng, futures=futures, start_id=start["update_id"])
+    start = _depth_snapshot(t0, px, rng, futures=futures, usd_scale=usd_scale)
+    latest = _depth_snapshot(current_time_ms, px, rng, futures=futures, usd_scale=usd_scale)
+    updates = _depth_updates(
+        n_upd, t0, px, rng, futures=futures, start_id=start["update_id"], usd_scale=usd_scale
+    )
     last_event_times: dict[str, np.int64] = {
         "trade": np.int64(int(trades["recv_ts_ms"][-1])),
         "bookTicker": np.int64(int(book_ticker["recv_ts_ms"][-1])),
@@ -322,39 +348,61 @@ def _venue(
         "depth": np.int64(int(latest["recv_ts_ms"])),
     }
     return {
-        "symbol": "BTCUSDT",
+        "symbol": symbol,
         "candles_1s": candles,
         "trades": trades,
         "book_ticker": book_ticker,
         "depth_start": start,
         "depth_updates": updates,
         "depth_latest": latest,
-        "liquidations": _liquidations(n_liq, current_time_ms, px, rng, futures=futures),
-        "depth_bands": _depth_bands(px, rng, current_time_ms, futures=futures),
+        "liquidations": _liquidations(
+            n_liq, current_time_ms, px, rng, futures=futures, usd_scale=usd_scale
+        ),
+        "depth_bands": _depth_bands(
+            px, rng, current_time_ms, futures=futures, bucket_usd=bucket_usd, usd_scale=usd_scale
+        ),
         "last_event_times": last_event_times,
     }
+
+
+# Spot reference used when ``make_sample_payload`` is not given a price.
+_SAMPLE_PX = {"BTC": 97_500.0, "ETH": 2_400.0, "SOL": 105.0, "XRP": 1.30}
 
 
 def make_sample_payload(
     seed: int = 0,
     *,
-    price: float = 97_500.0,
+    price: float | None = None,
     current_time_ms: int | None = None,
     compact: bool = False,
+    asset: str = "BTC",
 ) -> dict:
     """Build a schema_version-5 payload with NumPy arrays, oldest-first.
 
     ``current_time_ms`` is the forecast anchor. Candles are a trailing hour and
     trades / book ticker a trailing 60s of shape-faithful synthetic data.
     ``compact=True`` keeps the same keys and dtypes but short arrays.
+    ``asset`` is BTC, ETH, SOL, or XRP. Dollar steps stay the BTC sample's
+    steps when the price is the BTC reference.
     """
+    spec = asset_spec(asset)
+    if price is None:
+        price = _SAMPLE_PX[asset]
+    price = float(price)
+    scale = price / _SAMPLE_PX["BTC"]
     rng = np.random.default_rng(seed)
     now = int(current_time_ms if current_time_ms is not None else _DEFAULT_CURRENT_TIME_MS)
     t0 = now - TRADE_WINDOW_S * 1000
+    venue_kw = {
+        "symbol": spec.symbol,
+        "bucket_usd": spec.bucket_usd,
+        "usd_scale": scale,
+        "compact": compact,
+    }
     return {
         "schema_version": SCHEMA_VERSION,
         "prompt": {
-            "asset": "BTC",
+            "asset": asset,
             "horizon_seconds": HORIZON_SECONDS,
             "num_percentiles": NUM_PERCENTILES,
             "quantile_grid": "centered-100",
@@ -369,16 +417,16 @@ def make_sample_payload(
                 rng=rng,
                 futures=False,
                 complete_candles=True,
-                compact=compact,
+                **venue_kw,
             ),
             "futures": _venue(
                 current_time_ms=now,
                 t0=t0,
-                px=price + 8.0,
+                px=price + 8.0 * scale,
                 rng=rng,
                 futures=True,
                 complete_candles=False,
-                compact=compact,
+                **venue_kw,
             ),
         },
     }
@@ -574,8 +622,13 @@ def _assert_same_len(rows: dict, keys: tuple[str, ...], label: str) -> int:
 
 
 def assert_payload_schema(payload: dict) -> None:
-    """Fail if the payload does not match input.md schema_version 5."""
-    if int(payload["schema_version"]) != SCHEMA_VERSION:
+    """Fail if the payload is older than schema_version 5 or misses a required field.
+
+    Newer versions are accepted when they only add keys. ``prompt.asset`` must
+    be BTC, ETH, SOL, or XRP, and both venues must use that asset's symbol and
+    depth-band width.
+    """
+    if int(payload["schema_version"]) < SCHEMA_VERSION:
         raise ValueError("schema_version")
     prompt = payload["prompt"]
     for key in (
@@ -604,9 +657,13 @@ def assert_payload_schema(payload: dict) -> None:
         raise ValueError("prompt.num_percentiles")
     if str(prompt["quantile_grid"]) != "centered-100":
         raise ValueError("prompt.quantile_grid")
+    try:
+        spec = asset_spec(str(prompt.get("asset") or ""))
+    except ValueError:
+        raise ValueError("prompt.asset") from None
     for name, futures in (("spot", False), ("futures", True)):
         venue = payload["venues"][name]
-        if venue["symbol"] != "BTCUSDT":
+        if venue["symbol"] != spec.symbol:
             raise ValueError(f"{name}.symbol")
         candles = venue["candles_1s"]
         ohlcv = np.asarray(candles["ohlcv"])
@@ -681,6 +738,9 @@ def assert_payload_schema(payload: dict) -> None:
                 raise ValueError(f"{name}.depth_bands")
             if float(bands["anchor_price"]) <= 0.0:
                 raise ValueError(f"{name}.depth_bands.anchor_price")
+        bucket = float(bands["bucket_usd"])
+        if abs(bucket - float(spec.bucket_usd)) > max(1e-9, 1e-6 * float(spec.bucket_usd)):
+            raise ValueError(f"{name}.depth_bands.bucket_usd")
         last = venue.get("last_event_times")
         if not isinstance(last, dict):
             raise ValueError(f"{name}.last_event_times")

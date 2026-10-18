@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-from synth_ultra.constants import HORIZON_SECONDS
+from synth_ultra.constants import HORIZON_SECONDS, price_scale
 
 
 def microprice(bid_p: float, bid_q: float, ask_p: float, ask_q: float) -> float:
@@ -344,7 +344,12 @@ def _as_int_scalar(v: Any) -> int | None:
         return None
 
 
-def liquidation_signals(liquidations: dict | None, now_ms: int) -> tuple[float, float]:
+def liquidation_signals(
+    liquidations: dict | None,
+    now_ms: int,
+    qty_unit: float = 0.25,
+    hour_unit: float = 1.0,
+) -> tuple[float, float]:
     """Signed 10s pressure and 1h activity from futures liquidations.
 
     ``is_buy`` is the liquidation order's side, not the trapped position.
@@ -375,7 +380,7 @@ def liquidation_signals(liquidations: dict | None, now_ms: int) -> tuple[float, 
     if recent.any():
         qr = q[recent]
         signed = float(np.where(buy[hour][recent], qr, -qr).sum())
-    return math.tanh(signed / 0.25), math.tanh(float(q.sum()) / 1.0)
+    return math.tanh(signed / qty_unit), math.tanh(float(q.sum()) / hour_unit)
 
 
 _BAND_IDX: dict[int, np.ndarray] = {}
@@ -529,6 +534,7 @@ def reference_price(spot: dict | None, fut: dict | None) -> float:
 
 def extract(payload: dict) -> dict[str, float]:
     prompt = payload.get("prompt") or {}
+    asset = str(prompt.get("asset") or "BTC")
     venues = payload.get("venues") or {}
     spot = venues.get("spot") or {}
     fut = venues.get("futures") or {}
@@ -565,10 +571,17 @@ def extract(payload: dict) -> dict[str, float]:
     f_bt = book_ticker_stats(fut.get("book_ticker"))
 
     px = reference_price(spot, fut)
+    scale = price_scale(asset, px)
 
     ref = spot_mid if spot_mid > 0.0 else px
-    band_imb = depth_band_imbalance(spot.get("depth_bands"), ref, now_ms)
-    liq_dir, liq_hour = liquidation_signals(fut.get("liquidations"), now_ms)
+    bands = spot.get("depth_bands") or {}
+    bucket = float(bands.get("bucket_usd") or 0.0)
+    # Twenty bands is $200 on BTC. The same band count is the reach on every asset.
+    reach = 20.0 * bucket if bucket > 0.0 else 200.0
+    band_imb = depth_band_imbalance(bands, ref, now_ms, reach_usd=reach)
+    liq_dir, liq_hour = liquidation_signals(
+        fut.get("liquidations"), now_ms, qty_unit=0.25 / scale, hour_unit=1.0 / scale
+    )
 
     basis = 0.0
     if spot_micro > 0.0 and fut_micro > 0.0:

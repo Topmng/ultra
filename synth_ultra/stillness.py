@@ -19,7 +19,7 @@ import math
 
 import numpy as np
 
-from synth_ultra.constants import NUM_PERCENTILES
+from synth_ultra.constants import NUM_PERCENTILES, asset_spec
 
 _GRID_MS = 100
 _GRID_N = 600
@@ -113,11 +113,14 @@ def still_probability(x: np.ndarray, event: bool) -> float:
     return 1.0 / (1.0 + math.exp(-z))
 
 
-def apply(q: np.ndarray, px: float, x: np.ndarray | None, event: bool) -> np.ndarray:
+def apply(
+    q: np.ndarray, px: float, x: np.ndarray | None, event: bool, asset: str = "BTC"
+) -> np.ndarray:
     """Add the stillness point mass to a finished ladder ``q``."""
     if x is None or GAIN <= 0.0:
         return q
-    m0 = float(np.count_nonzero(np.abs(q - px) < 0.01)) / NUM_PERCENTILES
+    near = asset_spec(asset or "BTC").tick
+    m0 = float(np.count_nonzero(np.abs(q - px) < near)) / NUM_PERCENTILES
     x[_M0] = m0
     p = GAIN * still_probability(x, event) - m0
     if not (p > 0.0):
@@ -206,7 +209,19 @@ def _side_flow(trades: dict | None, now_ms: int, window_ms: int) -> tuple[float,
     return float(q.sum()) - sell, sell
 
 
-def _range_still(close: np.ndarray) -> tuple[float, float]:
+def _asset_steps(asset: str) -> tuple[float, float, float, float]:
+    """Spot step, futures step, candle-range tick, and spread scale.
+
+    BTC keeps the fitted dollar thresholds. A one-tick move on ETH, SOL, or
+    XRP is measured the same way, in that asset's own tick.
+    """
+    spec = asset_spec(asset or "BTC")
+    tick_scale = spec.tick / 0.01
+    fut_scale = spec.futures_tick / 0.1
+    return _SPOT_STEP * tick_scale, _FUT_STEP * fut_scale, _RANGE_TICK * tick_scale, 0.01 / spec.tick
+
+
+def _range_still(close: np.ndarray, tick: float = _RANGE_TICK) -> tuple[float, float]:
     """Share of 10-second candle windows whose closes stayed inside one tick."""
     c = close[-(_RANGE_LONG + 10) :]
     if c.size < 41:
@@ -217,7 +232,7 @@ def _range_still(close: np.ndarray) -> tuple[float, float]:
     for step in (2, 4, 3):
         hi = np.maximum(hi[:-step], hi[step:])
         lo = np.minimum(lo[:-step], lo[step:])
-    held = (hi - lo) <= _RANGE_TICK
+    held = (hi - lo) <= tick
     short = held[-_RANGE_SHORT:]
     return float(np.count_nonzero(held)) / held.size, float(np.count_nonzero(short)) / short.size
 
@@ -280,6 +295,7 @@ def still_features(
     now_ms: int,
     seas_abs: float,
     m0: float,
+    asset: str = "BTC",
 ) -> np.ndarray | None:
     """Feature vector in ``FEATURES`` order. None without a minute of spot quotes."""
     venues = payload.get("venues") or {}
@@ -289,8 +305,9 @@ def still_features(
     grid = _mid_grid(book, now_ms)
     if grid is None or grid.size <= _WIN + 1:
         return None
-    n60, n10, age = _changes(grid, _SPOT_STEP)
-    held = np.abs(grid[_WIN:] - grid[:-_WIN]) <= _SPOT_STEP
+    spot_step, fut_step, range_tick, spread_scale = _asset_steps(asset)
+    n60, n10, age = _changes(grid, spot_step)
+    held = np.abs(grid[_WIN:] - grid[:-_WIN]) <= spot_step
     p0book = float(np.count_nonzero(held)) / held.size
     bq = _last(book.get("bid_qty"))
     aq = _last(book.get("ask_qty"))
@@ -302,10 +319,10 @@ def still_features(
     )
     fgrid = _mid_grid(fut.get("book_ticker"), now_ms)
     if fgrid is not None and fgrid.size > 2:
-        f60, f10, _fage = _changes(fgrid, _FUT_STEP)
+        f60, f10, _fage = _changes(fgrid, fut_step)
     else:
         f60 = f10 = 0.0
-    r30, r5 = _range_still(close)
+    r30, r5 = _range_still(close, range_tick)
     vals = [
         p0book,
         math.exp(-n60 / 6.0),
@@ -313,7 +330,7 @@ def still_features(
         math.log1p(age),
         math.log1p(max(min(bq, aq), 0.0)),
         q_flow,
-        min(max(spread, 0.0), 1.0),
+        min(max(spread * spread_scale, 0.0), 1.0),
         math.log1p(f10),
         math.log1p(f60),
         r30,
