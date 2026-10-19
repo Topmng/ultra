@@ -19,7 +19,7 @@ import math
 
 import numpy as np
 
-from synth_ultra.constants import NUM_PERCENTILES, asset_spec
+from synth_ultra.constants import BTC_REF_PX, NUM_PERCENTILES, asset_spec
 
 _GRID_MS = 100
 _GRID_N = 600
@@ -50,6 +50,11 @@ FEATURES = (
 
 _TAU = (2.0 * np.arange(1, NUM_PERCENTILES + 1) - 1.0) / 200.0
 _M0 = FEATURES.index("m0")
+_XBUF = np.empty(len(FEATURES), dtype=np.float64)
+_R = np.empty(NUM_PERCENTILES, dtype=np.float64)
+_OUT = np.empty(NUM_PERCENTILES, dtype=np.float64)
+_POS = np.empty(NUM_PERCENTILES, dtype=np.float64)
+_I0 = np.empty(NUM_PERCENTILES, dtype=np.int64)
 
 # Logistic weights, intercept first, then FEATURES order. Fit by
 # scripts/fit_stillness.py on the saved prompts; clock and trade-triggered
@@ -101,6 +106,11 @@ P_MAX = 0.9
 KAPPA = 0.75
 SHIFT = 1.0
 HOLE = 0.05
+# BTC's saved prompts were over-concentrated on the touch: a smaller gain and a
+# wider residual ladder lowered every 24-hour window. ETH, SOL, and XRP keep
+# the original fit; the same change raised at least one of their windows.
+_GAIN_ASSET = {"BTC": 0.7}
+_KAPPA_ASSET = {"BTC": 1.1}
 
 
 def still_probability(x: np.ndarray, event: bool) -> float:
@@ -117,18 +127,21 @@ def apply(
     q: np.ndarray, px: float, x: np.ndarray | None, event: bool, asset: str = "BTC"
 ) -> np.ndarray:
     """Add the stillness point mass to a finished ladder ``q``."""
-    if x is None or GAIN <= 0.0:
+    name = asset or "BTC"
+    gain = _GAIN_ASSET.get(name, GAIN)
+    kappa = _KAPPA_ASSET.get(name, KAPPA)
+    if x is None or gain <= 0.0:
         return q
-    near = asset_spec(asset or "BTC").tick
+    near = asset_spec(name).tick
     m0 = float(np.count_nonzero(np.abs(q - px) < near)) / NUM_PERCENTILES
     x[_M0] = m0
-    p = GAIN * still_probability(x, event) - m0
+    p = gain * still_probability(x, event) - m0
     if not (p > 0.0):
         return q
     p = min(p, P_MAX)
     med = 0.5 * (float(q[49]) + float(q[50]))
     width = float(np.abs(q - med).sum()) / NUM_PERCENTILES
-    return mix_still(q, px, p, width, KAPPA, SHIFT, HOLE)
+    return mix_still(q, px, p, width, kappa, SHIFT, HOLE)
 
 
 def _i64(x: object) -> np.ndarray:
@@ -209,6 +222,18 @@ def _side_flow(trades: dict | None, now_ms: int, window_ms: int) -> tuple[float,
     return float(q.sum()) - sell, sell
 
 
+def _qty_unit(asset: str, px: float) -> float:
+    """Coin quantity to the notional units the stillness fit saw on BTC.
+
+    A SOL or XRP queue is a large coin count and a small dollar count. Left
+    in coins, ``log1p(qty)`` saturates the logistic and the point mass stays
+    on the touch after the price has already left.
+    """
+    if str(asset or "BTC") == "BTC" or not math.isfinite(px) or px <= 0.0:
+        return 1.0
+    return px / BTC_REF_PX
+
+
 def _asset_steps(asset: str) -> tuple[float, float, float, float]:
     """Spot step, futures step, candle-range tick, and spread scale.
 
@@ -242,6 +267,20 @@ def _last(x: object) -> float:
     return float(a[-1]) if a.size else 0.0
 
 
+def _qat(r: np.ndarray, t: np.ndarray, out: np.ndarray, sl: slice) -> None:
+    """Write the 100-knot quantile function of ``r`` at probabilities ``t[sl]``."""
+    pos = _POS[sl]
+    np.subtract(t[sl], 0.005, out=pos)
+    pos *= 100.0
+    np.clip(pos, 0.0, 99.0, out=pos)
+    i0 = _I0[sl]
+    i0[:] = pos
+    np.minimum(i0, 98, out=i0)
+    np.subtract(pos, i0, out=pos)
+    np.multiply(r[i0], 1.0 - pos, out=out[sl])
+    out[sl] += r[i0 + 1] * pos
+
+
 def mix_still(
     q: np.ndarray,
     px: float,
@@ -262,13 +301,16 @@ def mix_still(
         return q
     med = 0.5 * (float(q[49]) + float(q[50]))
     sh = shift * p / (1.0 - p) * (med - px)
-    r = q + sh
+    r = _R
+    np.add(q, sh, out=r)
     r += (kappa * p) * (r - (med + sh))
     h = hole * width
     if h > 0.0:
         d = r - px
         a = np.abs(d)
         r = px + np.sign(d) * (a + h * (1.0 - np.exp(-a / h)))
+        _R[:] = r
+        r = _R
     k = int(np.searchsorted(r, px, side="left"))
     if k <= 0:
         t_left = 0.0
@@ -282,11 +324,17 @@ def mix_still(
     keep = 1.0 - p
     t1 = keep * t_left
     t2 = t1 + p
-    below = np.interp(_TAU / keep, _TAU, r)
-    above = np.interp((_TAU - p) / keep, _TAU, r)
-    out = np.where(_TAU < t1, below, np.where(_TAU <= t2, px, above))
+    out = _OUT
+    i1 = int(np.searchsorted(_TAU, t1, side="left"))
+    i2 = int(np.searchsorted(_TAU, t2, side="right"))
+    if i1:
+        _qat(r, _TAU / keep, out, slice(0, i1))
+    if i2 > i1:
+        out[i1:i2] = px
+    if i2 < NUM_PERCENTILES:
+        _qat(r, (_TAU - p) / keep, out, slice(i2, NUM_PERCENTILES))
     np.maximum.accumulate(out, out=out)
-    return out
+    return out.copy()
 
 
 def still_features(
@@ -311,11 +359,18 @@ def still_features(
     p0book = float(np.count_nonzero(held)) / held.size
     bq = _last(book.get("bid_qty"))
     aq = _last(book.get("ask_qty"))
-    spread = _last(book.get("ask_price")) - _last(book.get("bid_price"))
+    bid = _last(book.get("bid_price"))
+    ask = _last(book.get("ask_price"))
+    spread = ask - bid
+    unit = _qty_unit(asset, 0.5 * (bid + ask))
+    bq_u = max(bq, 0.0) * unit
+    aq_u = max(aq, 0.0) * unit
     buy, sell = _side_flow(spot.get("trades"), now_ms, 10_000)
+    buy_u = max(buy, 0.0) * unit
+    sell_u = max(sell, 0.0) * unit
     q_flow = min(
-        math.log((max(bq, 0.0) + 1e-3) / (sell + 0.05)),
-        math.log((max(aq, 0.0) + 1e-3) / (buy + 0.05)),
+        math.log((bq_u + 1e-3) / (sell_u + 0.05)),
+        math.log((aq_u + 1e-3) / (buy_u + 0.05)),
     )
     fgrid = _mid_grid(fut.get("book_ticker"), now_ms)
     if fgrid is not None and fgrid.size > 2:
@@ -323,19 +378,18 @@ def still_features(
     else:
         f60 = f10 = 0.0
     r30, r5 = _range_still(close, range_tick)
-    vals = [
-        p0book,
-        math.exp(-n60 / 6.0),
-        math.log1p(n10),
-        math.log1p(age),
-        math.log1p(max(min(bq, aq), 0.0)),
-        q_flow,
-        min(max(spread * spread_scale, 0.0), 1.0),
-        math.log1p(f10),
-        math.log1p(f60),
-        r30,
-        r5,
-        math.log(seas_abs) if seas_abs > 0.0 else 0.0,
-        m0,
-    ]
-    return np.array(vals, dtype=np.float64)
+    x = _XBUF
+    x[0] = p0book
+    x[1] = math.exp(-n60 / 6.0)
+    x[2] = math.log1p(n10)
+    x[3] = math.log1p(age)
+    x[4] = math.log1p(max(min(bq_u, aq_u), 0.0))
+    x[5] = q_flow
+    x[6] = min(max(spread * spread_scale, 0.0), 1.0)
+    x[7] = math.log1p(f10)
+    x[8] = math.log1p(f60)
+    x[9] = r30
+    x[10] = r5
+    x[11] = math.log(seas_abs) if seas_abs > 0.0 else 0.0
+    x[12] = m0
+    return x

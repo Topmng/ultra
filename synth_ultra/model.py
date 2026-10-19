@@ -9,9 +9,10 @@ candle mass and a louder hour keeps the mixture tails. On the
 mixture path the fitted drift is scaled to 85% and 60% of the last
 one-second move is added. Top-of-book imbalance shifts the center by a
 fraction of the width, more so after a trade print, and a trade print also
-moves the forecast along the last second of futures taker flow. Finally
-``stillness`` puts a point mass on the current microprice, sized by how
-still the live spot and futures quotes have been.
+moves the forecast along the last second of futures taker flow, then
+pulls back the spent 1s futures micro-move. Finally ``stillness`` puts a
+point mass on the current microprice, sized by how still the live spot
+and futures quotes have been.
 Never-raise fallback so a non-answer is not charged under FAQ.md.
 
 Every hour-of-candles statistic is read from one pass over the 10-second
@@ -26,7 +27,7 @@ import math
 
 import numpy as np
 
-from synth_ultra.constants import HORIZON_SECONDS, NUM_PERCENTILES, price_scale
+from synth_ultra.constants import HORIZON_SECONDS, NUM_PERCENTILES, asset_spec, price_scale
 from synth_ultra.features import extract, reference_price
 from synth_ultra.season_table import SEAS_ABS as _SEAS_ABS
 from synth_ultra.season_table import SEAS_REL as _SEAS_REL
@@ -1005,12 +1006,22 @@ def _widen_event_center(pct: np.ndarray) -> np.ndarray:
 
 
 def _candle_weight(
-    p90: float | None, trigger: str, candle_ok: bool, activity: float
+    p90: float | None,
+    trigger: str,
+    candle_ok: bool,
+    activity: float,
+    scale: float = 1.0,
 ) -> float:
-    """Share of the candle distribution on a clock prompt. Zero otherwise."""
+    """Share of the candle distribution on a clock prompt. Zero otherwise.
+
+    ``scale`` is 1 for BTC. Other assets use the same log-return threshold:
+    the fitted $7.5 pivot is a BTC price, and a raw dollar comparison keeps
+    ETH, SOL, and XRP on the quiet-hour candle path.
+    """
     if trigger != "time" or not candle_ok or p90 is None or not math.isfinite(p90):
         return 0.0
-    z = (float(p90) - _BLEND_PIVOT) / _BLEND_TEMP + _BLEND_BETA * float(activity)
+    span = scale if math.isfinite(scale) and scale > 0.0 else 1.0
+    z = (float(p90) - _BLEND_PIVOT * span) / (_BLEND_TEMP * span) + _BLEND_BETA * float(activity)
     if z >= 20.0:
         return 0.0
     if z <= -20.0:
@@ -1106,6 +1117,7 @@ def _combine(
     p90: float | None,
     trigger: str,
     activity: float,
+    scale: float = 1.0,
 ) -> np.ndarray:
     """Mix the candle and mixture distributions on clock prompts.
 
@@ -1118,7 +1130,7 @@ def _combine(
     mixture = ladder + shift
     np.maximum(mixture, _MIN_PRICE, out=mixture)
     np.maximum.accumulate(mixture, out=mixture)
-    weight = _candle_weight(p90, trigger, candle is not None, activity)
+    weight = _candle_weight(p90, trigger, candle is not None, activity, scale)
     if candle is None or weight <= 1e-4:
         return mixture
     if weight >= 1.0 - 1e-4:
@@ -1205,7 +1217,7 @@ def _forecast_from_parts(
     bins, p90, activity = h.candle_parts(px)
     candle = None if bins is None else _skewed_candle_prices(px, bins, mu_px)
     c1_px = float(f["c1"]) * px
-    mixed = _combine(ladder, candle, mu_px, c1_px, p90, trigger, activity)
+    mixed = _combine(ladder, candle, mu_px, c1_px, p90, trigger, activity, scale)
     if trigger != "time":
         mixed = _widen_event_center(mixed)
     last_mu_px = float(mu_px)
@@ -1221,19 +1233,39 @@ _FLOW_K = 0.10
 _FLOW_SD = 5.644958570072203
 _FLOW_CLIP = 4.0
 _FLOW_MS = 1000
+# The linear path and the last-second candle already spend the 1s futures
+# micro return. On trade prints that overshoots: one standardized 1s futures
+# move pulls the ladder back by this fraction of its width. Fit on the first
+# 60% of saved event prompts; the later 40% improved by more.
+_FM1_K = -0.08
+_FM1_SD = 7.34486046119216e-05
+_FM1_CLIP = 4.0
 
 
-def _flow_shift(
-    q: np.ndarray, fut: dict | None, now_ms: int, flow_sd: float = _FLOW_SD
+def _event_shift(
+    q: np.ndarray,
+    f: dict[str, float],
+    fut: dict | None,
+    now_ms: int,
+    flow_sd: float = _FLOW_SD,
+    fm1_sd: float = _FM1_SD,
 ) -> np.ndarray:
-    """Shift a trade-triggered forecast along the last second of futures taker flow."""
+    """Trade-print location: futures taker flow minus the spent 1s futures move."""
     flow = taker_flow((fut or {}).get("trades"), now_ms, _FLOW_MS)
-    z = _clip(flow / flow_sd, -_FLOW_CLIP, _FLOW_CLIP)
-    if not (z != 0.0) or not math.isfinite(z):
+    zf = _clip(flow / flow_sd, -_FLOW_CLIP, _FLOW_CLIP)
+    denom = fm1_sd if math.isfinite(fm1_sd) and fm1_sd > 0.0 else _FM1_SD
+    zm = _clip(float(f["f_m1"]) / denom, -_FM1_CLIP, _FM1_CLIP)
+    delta = _FLOW_K * zf + _FM1_K * zm
+    if not (delta != 0.0) or not math.isfinite(delta):
         return q
     med = 0.5 * (float(q[49]) + float(q[50]))
     width = float(np.abs(q - med).sum()) / NUM_PERCENTILES
-    return q + _FLOW_K * z * width
+    return q + delta * width
+
+
+def _flow_shift(q: np.ndarray, fut: dict | None, now_ms: int) -> np.ndarray:
+    """Futures-flow half of ``_event_shift``, for research timings."""
+    return _event_shift(q, {"f_m1": 0.0}, fut, now_ms)
 
 
 def _fallback(payload: dict) -> np.ndarray:
@@ -1270,11 +1302,11 @@ def predict_percentiles(payload: dict) -> np.ndarray:
         f = extract(payload)
         closes = _venue_closes(spot)
         book = spot.get("book_ticker")
-        # No spot book and no spot hour: the futures candles are the only
-        # 10-second history. A live spot book keeps the old empty-candle path.
-        book_ts = None if not book else book.get("recv_ts_ms")
-        if closes.size < 40 and (book_ts is None or len(book_ts) == 0):
-            fut_closes = _venue_closes(venues.get("futures") or {})
+        # A missing spot hour used to leave the ladder on the book alone, which
+        # is too tight once the book is live. Futures candles are the same
+        # 10-second moves in log space; the anchor stays the spot microprice.
+        if closes.size < 40:
+            fut_closes = _venue_closes((venues.get("futures") or {}))
             if fut_closes.size >= 40:
                 closes = fut_closes
         hour = _Hour(closes)
@@ -1306,6 +1338,122 @@ def _valid(out: np.ndarray) -> bool:
     return out.shape == (NUM_PERCENTILES,) and out[0] > 0.0 and math.isfinite(float(out.sum()))
 
 
+# The fitted ladder is a bit wide of the last few minutes once the regime has
+# cooled, and a bit tight after it has heated up. Move 50% of the way toward
+# the width of the latest 180 overlapping 10-second moves, and never by more
+# than 10%. The stillness atom is put back on the anchor afterwards.
+_LIVE_POW = 0.50
+_LIVE_LO = 0.90
+_LIVE_HI = 1.10
+_LIVE_N = 180
+_ATOM = 0.02
+
+
+def _atom_band(asset: str, scale: float) -> float:
+    """Prices this close to the anchor are the stillness point mass.
+
+    BTC keeps the fitted two-cent band. On ETH, SOL, and XRP that band
+    scaled by price falls through the tick, so the live-width step was
+    smearing the atom off the touch.
+    """
+    if asset == "BTC":
+        return _ATOM
+    tick = asset_spec(asset).tick
+    return max(_ATOM * scale, tick)
+
+
+def _live_fm1_sd(closes: np.ndarray) -> float:
+    """Scale of a 1-second log move from this asset's own candle tail.
+
+    The fitted ``_FM1_SD`` is BTC's. ETH, SOL, and XRP run hotter, so the
+    same constant treats an ordinary print as a four-sigma futures move.
+    """
+    c = closes.reshape(-1) if isinstance(closes, np.ndarray) else np.asarray(closes, dtype=np.float64)
+    if c.size > 181:
+        c = c[-181:]
+    keep = np.isfinite(c) & (c > 0.0)
+    if not bool(keep.all()):
+        c = c[keep]
+    if c.size < 40:
+        return _FM1_SD
+    r = np.diff(np.log(c))
+    r = r[np.isfinite(r)]
+    if r.size < 30:
+        return _FM1_SD
+    sd = float(r.std())
+    if not math.isfinite(sd) or sd <= 0.0:
+        return _FM1_SD
+    return _clip(sd, 0.5 * _FM1_SD, 12.0 * _FM1_SD)
+
+
+def _live_width(
+    q: np.ndarray,
+    closes: np.ndarray,
+    anchor: float,
+    scale: float = 1.0,
+    atom: float = _ATOM,
+) -> np.ndarray:
+    """Rescale a finished ladder toward the payload's own recent 10s moves."""
+    c = closes.reshape(-1) if isinstance(closes, np.ndarray) else np.asarray(closes, dtype=np.float64)
+    if c.size < 40:
+        return q
+    keep = np.isfinite(c) & (c > 0.0)
+    if not bool(keep.all()):
+        c = c[keep]
+    if c.size < 40:
+        return q
+    d = c[10:] - c[:-10]
+    if d.size > _LIVE_N:
+        d = d[-_LIVE_N:]
+    d = d[np.isfinite(d)]
+    if d.size < 40:
+        return q
+    emp = np.quantile(d, _TAU)
+    em = 0.5 * (float(emp[49]) + float(emp[50]))
+    ew = float(np.abs(emp - em).mean())
+    med = 0.5 * (float(q[49]) + float(q[50]))
+    width = float(np.abs(q - med).mean())
+    if not math.isfinite(ew) or ew <= 0.0 or width < 0.5 * scale or not math.isfinite(med):
+        return q
+    alpha = _clip((ew / width) ** _LIVE_POW, _LIVE_LO, _LIVE_HI)
+    if abs(alpha - 1.0) < 1e-4:
+        return q
+    x = med + alpha * (q - med)
+    on = np.abs(q - anchor) <= atom
+    if bool(on.any()):
+        x[on] = q[on]
+    np.maximum(x, _MIN_PRICE, out=x)
+    np.maximum.accumulate(x, out=x)
+    if not math.isfinite(float(x.sum())) or float(x[0]) <= 0.0:
+        return q
+    return x
+
+
+# Residual scale after the BTC ladder is expressed in each asset's own units.
+# Picked on the earlier half of the saved prompts; the later half agreed.
+# ETH is closest to BTC's log-vol, SOL and XRP run wider than that fit.
+_WIDTH_ASSET = {"ETH": 1.25, "SOL": 1.50, "XRP": 1.60}
+
+
+def _asset_width(q: np.ndarray, anchor: float, asset: str, scale: float) -> np.ndarray:
+    """Open a non-BTC ladder. The stillness prices on the touch stay put."""
+    alpha = _WIDTH_ASSET.get(asset, 1.0)
+    if alpha == 1.0:
+        return q
+    med = 0.5 * (float(q[49]) + float(q[50]))
+    if not math.isfinite(med):
+        return q
+    x = med + alpha * (q - med)
+    on = np.abs(q - anchor) <= _atom_band(asset, scale)
+    if bool(on.any()):
+        x[on] = q[on]
+    np.maximum(x, _MIN_PRICE, out=x)
+    np.maximum.accumulate(x, out=x)
+    if not math.isfinite(float(x.sum())) or float(x[0]) <= 0.0:
+        return q
+    return x
+
+
 def _post_layers(
     out: np.ndarray,
     payload: dict,
@@ -1315,22 +1463,91 @@ def _post_layers(
     trigger: str,
     asset: str = "BTC",
 ) -> np.ndarray:
-    """Futures-flow shift and the stillness point mass. A bad result keeps ``out``."""
+    """Event location shift, stillness, then a width check against recent moves."""
     event = trigger != "time"
     q = out
     anchor = max(f["price"], _MIN_PRICE)
     scale = price_scale(asset, anchor)
     if event:
-        q = _flow_shift(
+        fm1_sd = _FM1_SD if asset == "BTC" else _live_fm1_sd(closes)
+        q = _event_shift(
             q,
+            f,
             (payload.get("venues") or {}).get("futures"),
             now_ms,
             flow_sd=_FLOW_SD / scale,
+            fm1_sd=fm1_sd,
         )
     seas = float(_SEAS_ABS[_slot_index(now_ms)]) if now_ms >= 0 else 0.0
     x = still_features(payload, closes, now_ms, seas, 0.0, asset=asset)
     q = apply_stillness(q, anchor, x, event, asset=asset)
+    q = _live_width(q, closes, anchor, scale, _atom_band(asset, scale))
+    q = _asset_width(q, anchor, asset, scale)
+    q = _vol_blend(q, f, asset)
+    q = _remap_quantiles(q, asset)
     return q if _valid(q) else out
+
+
+# Median-centered mixture scaled by the asset's own 1-second vol, mixed into
+# the finished ladder. k is the vol multiple, a is the mixture share. Chosen
+# so every 24-hour window of the saved prompts scores lower. BTC is left on
+# the feature ladder; a vol mix there raised the loud windows.
+_VOL_BLEND = {"ETH": (0.80, 0.04), "SOL": (0.70, 0.35), "XRP": (0.80, 0.14)}
+
+
+def _vol_blend(q: np.ndarray, f: dict[str, float], asset: str) -> np.ndarray:
+    """Pull an alt ladder toward a short-horizon mixture, keeping its median."""
+    spec = _VOL_BLEND.get(asset)
+    if spec is None:
+        return q
+    k, share = spec
+    vol = float(f.get("vol_1s") or 0.0)
+    px = float(f.get("price") or 0.0)
+    if not (vol > 0.0 and px > 0.0 and 0.0 < share < 1.0):
+        return q
+    sig = float(k) * px * vol * _SQRT_H
+    if not math.isfinite(sig) or sig <= 0.0:
+        return q
+    med = 0.5 * (float(q[49]) + float(q[50]))
+    if not math.isfinite(med):
+        return q
+    out = (1.0 - share) * q + share * (med + sig * _MIX_Z)
+    np.maximum(out, _MIN_PRICE, out=out)
+    np.maximum.accumulate(out, out=out)
+    return out
+
+
+# Probability warp of the finished BTC ladder. The new quantile at tau is the
+# old quantile at g(tau), with g fit on the earlier saved prompts and checked
+# on the later ones. It widens the body and shifts the center down a fraction
+# of the width. ETH, SOL, and XRP had no warp that lowered every 24-hour window.
+_REMAP_KNOTS = np.array([0.0, 0.05, 0.15, 0.30, 0.50, 0.70, 0.85, 0.95, 1.0])
+_REMAP_G = {
+    "BTC": np.array([0.0, 0.05, 0.13, 0.265, 0.465, 0.715, 0.87, 0.945, 1.0]),
+}
+
+
+def _remap_index(g_knots: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    g = np.interp(_TAU, _REMAP_KNOTS, g_knots)
+    g = np.clip(g, float(_TAU[0]), float(_TAU[-1]))
+    pos = (g - _TAU[0]) / (_TAU[1] - _TAU[0])
+    i0 = np.clip(np.floor(pos).astype(np.int64), 0, NUM_PERCENTILES - 2)
+    return i0, pos - i0
+
+
+_REMAP_INDEX = {name: _remap_index(knots) for name, knots in _REMAP_G.items()}
+
+
+def _remap_quantiles(q: np.ndarray, asset: str) -> np.ndarray:
+    """Read the ladder at a warped probability grid."""
+    index = _REMAP_INDEX.get(asset)
+    if index is None:
+        return q
+    i0, frac = index
+    out = q[i0] * (1.0 - frac) + q[i0 + 1] * frac
+    np.maximum(out, _MIN_PRICE, out=out)
+    np.maximum.accumulate(out, out=out)
+    return out
 
 
 def _warmup_payload(trigger: str) -> dict:

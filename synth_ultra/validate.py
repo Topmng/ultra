@@ -61,30 +61,12 @@ def write_crps_csv(path: Path, reports: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(
-            (
-                "test",
-                "current_time_ms",
-                "start",
-                "target",
-                "book_recv_ts_ms",
-                "realized",
-                "crps",
-                "predict_ms",
-            )
-        )
-        for i, one in enumerate(reports, start=1):
+        writer.writerow(("start", "crps", "predict_ms"))
+        for one in reports:
             crps = one.get("crps")
-            realized = one.get("realized_price")
-            book_recv = one.get("book_recv_ts_ms")
             writer.writerow(
                 (
-                    i,
-                    one.get("current_time_ms", ""),
                     one["current_time_utc"],
-                    one["target_utc"],
-                    "" if book_recv is None else book_recv,
-                    "" if realized is None else f"{float(realized):.6f}",
                     "" if crps is None else f"{float(crps):.6f}",
                     f"{float(one['max_ms']):.3f}",
                 )
