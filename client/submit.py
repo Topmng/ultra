@@ -55,6 +55,8 @@ from bittensor import sp_core
 API_DEFAULT = "https://vhft-submit.synthdata.co"
 SUBMIT_PREFIX = "vhft-submission|v1"
 STATUS_PREFIX = "vhft-status|v1"
+ONBOARD_STATUS_PREFIX = "vhft-onboard-status|v1"
+REGISTRY_HOST = "asia-northeast1-docker.pkg.dev"
 
 
 def canonical_payload_json(payload: dict) -> bytes:
@@ -94,6 +96,43 @@ def _request(method: str, url: str, body: dict | None = None) -> tuple[int, str]
         return e.code, e.read().decode()
 
 
+def cmd_credentials(args, kp) -> None:
+    """Collect the push key. Limited retrievals — save the file."""
+    ts = int(time.time())
+    message = f"{ONBOARD_STATUS_PREFIX}|{kp.ss58_address}|{ts}"
+    sig = "0x" + kp.sign(message.encode()).hex()
+    url = f"{args.api}/v1/onboard/credentials?hotkey={kp.ss58_address}&timestamp={ts}&signature={sig}"
+    print(f"GET    : {args.api}/v1/onboard/credentials")
+    code, resp = _request("GET", url)
+    if code != 200:
+        print(f"-> {code} {resp}")
+        if code == 404:
+            print("\nNo record for this hotkey. Ask Synth to register you first.")
+        elif code == 410:
+            print("\nYour retrievals are used up. Ask Synth to re-issue a key.")
+        return
+
+    data = json.loads(resp)
+    status = data.get("status")
+    if status != "provisioned":
+        # pending_review = waiting on a human; provisioning = approved, being set up
+        print(f"-> 200 {resp}")
+        print("\nNot ready yet. Try again later." if status else "")
+        return
+
+    key, slug = data.get("push_key"), data.get("slug")
+    out = pathlib.Path(args.out or f"vhft-push-{slug}.json")
+    out.write_text(key)
+    out.chmod(0o600)
+    remaining = data.get("retrievals_remaining")
+    print(f"-> 200 key written to {out} (retrievals remaining: {remaining})")
+    print(f"\nKEEP THIS FILE. You have {remaining} retrieval(s) left, then it cannot be fetched again.\n")
+    print("Log in to the registry:")
+    print(f"  cat {out} | docker login -u _json_key --password-stdin https://{REGISTRY_HOST}")
+    print("\nBuild for linux/amd64, push, then submit the digest docker prints:")
+    print(f"  docker push {data.get('image_uri')}:v1")
+
+
 def cmd_submit(args, kp) -> None:
     ts = int(time.time())
     payload = {"image_uri": args.image_uri, "image_digest": args.image_digest, "version": args.version}
@@ -121,13 +160,16 @@ def cmd_status(args, kp) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Synth Ultra submission client")
-    ap.add_argument("command", choices=["submit", "status"])
+    ap = argparse.ArgumentParser(description="Synth Ultra onboarding + submission client")
+    ap.add_argument("command", choices=["credentials", "submit", "status"])
     ap.add_argument("--api", default=API_DEFAULT, help=f"submission API base (default {API_DEFAULT})")
     ap.add_argument("--wallet", help="bittensor coldkey wallet name")
     ap.add_argument("--hotkey", help="bittensor hotkey name under that wallet")
     ap.add_argument("--mnemonic", help="raw hotkey mnemonic (alternative to --wallet/--hotkey)")
     ap.add_argument("--uri", help="dev throwaway URI, e.g. //Alice (testing only)")
+    # credentials
+    ap.add_argument("--out", help="where to write the push key (credentials)")
+    # submit
     ap.add_argument("--image-uri", help="registry image reference (without the digest)")
     ap.add_argument("--image-digest", help="the sha256:... digest from `docker push`")
     ap.add_argument("--version", type=int, default=1, help="your submission version (>= 1)")
@@ -135,7 +177,9 @@ def main() -> None:
     if args.command == "submit" and not (args.image_uri and args.image_digest):
         raise SystemExit("submit requires --image-uri and --image-digest")
     kp = load_keypair(args)
-    (cmd_submit if args.command == "submit" else cmd_status)(args, kp)
+    {"credentials": cmd_credentials, "submit": cmd_submit, "status": cmd_status}[args.command](
+        args, kp
+    )
 
 
 if __name__ == "__main__":

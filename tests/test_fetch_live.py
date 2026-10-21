@@ -239,3 +239,38 @@ def test_two_websocket_frames_in_one_buffer():
     sock = type("Sock", (), {"_ws_buf": _text_frame("one") + _text_frame("two"), "_ws_frag": None})()
     assert _ws_next_text(sock) == "one"
     assert _ws_next_text(sock) == "two"
+
+
+def test_use_asset_switches_symbol_bucket_and_streams():
+    import fetch_live
+    from fetch_live import use_asset
+
+    now = 1_700_000_060_000
+    try:
+        for name, symbol, bucket, stream in (
+            ("ETH", "ETHUSDT", 0.5, "ethusdt@aggTrade"),
+            ("sol", "SOLUSDT", 0.03, "solusdt@aggTrade"),
+        ):
+            spec = use_asset(name)
+            assert spec.symbol == symbol
+            assert fetch_live.SYMBOL == symbol
+            assert fetch_live.ASSET == name.upper()
+            payload = assemble_payload(
+                _capture(now),
+                spot_candles=_candles(now - 4_000),
+                futures_candles=_candles(now - 4_000),
+                current_time_ms=now,
+            )
+            assert_env_payload_schema(payload)
+            assert payload["prompt"]["asset"] == name.upper()
+            assert payload["venues"]["spot"]["symbol"] == symbol
+            assert payload["venues"]["futures"]["symbol"] == symbol
+            assert float(payload["venues"]["spot"]["depth_bands"]["bucket_usd"]) == bucket
+            assert float(payload["venues"]["futures"]["depth_bands"]["bucket_usd"]) == bucket
+            assert stream in {item[4] for item in RAW_STREAMS}
+            assert fetch_live.RAW_STREAMS is RAW_STREAMS
+    finally:
+        use_asset("BTC")
+    assert fetch_live.SYMBOL == "BTCUSDT"
+    assert fetch_live.ASSET == "BTC"
+    assert "btcusdt@aggTrade" in {item[4] for item in RAW_STREAMS}

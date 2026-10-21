@@ -5,10 +5,11 @@
 
 FROM --platform=linux/amd64 ghcr.io/synthdataco/vhft-miner-base:v2
 # Frozen digest for this round (optional pin):
-# FROM --platform=linux/amd64 ghcr.io/synthdataco/vhft-miner-base@sha256:66dbeb6f64cab66383333b1499b0fe45a186e5d7bf2f1ade2ddacc3342e1d6ca
+# FROM --platform=linux/amd64 ghcr.io/synthdataco/vhft-miner-base@sha256:47e3a095ae495dec695bc69ba613725e9e83fc7855bf97e7a3f35179a5e1c25d
 
 ENV PYTHONPATH=/app \
     VHFT_MINER_ENTRYPOINT=synth_ultra.model
 
+# Serving package only. Local tools live in harness/ and are not copied.
 COPY synth_ultra/ /app/synth_ultra/
 COPY model.py /app/model.py

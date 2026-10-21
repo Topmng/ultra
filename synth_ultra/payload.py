@@ -116,11 +116,11 @@ def depth_bands_from_book(
         or bid_book.shape[1] < 2
         or ask_book.shape[1] < 2
     ):
-        return empty_depth_bands()
+        return empty_depth_bands(bucket_usd)
     anchor = 0.5 * (float(bid_book[0, 0]) + float(ask_book[0, 0]))
     bucket = float(bucket_usd)
     if not np.isfinite(anchor) or anchor <= 0.0 or bucket <= 0.0:
-        return empty_depth_bands()
+        return empty_depth_bands(bucket_usd)
     bid_qty = np.zeros(int(n_bands), dtype=np.float64)
     ask_qty = np.zeros(int(n_bands), dtype=np.float64)
     dist = (anchor - bid_book[:, 0]) / bucket

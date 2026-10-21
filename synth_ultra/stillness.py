@@ -106,11 +106,6 @@ P_MAX = 0.9
 KAPPA = 0.75
 SHIFT = 1.0
 HOLE = 0.05
-# BTC's saved prompts were over-concentrated on the touch: a smaller gain and a
-# wider residual ladder lowered every 24-hour window. ETH, SOL, and XRP keep
-# the original fit; the same change raised at least one of their windows.
-_GAIN_ASSET = {"BTC": 0.7}
-_KAPPA_ASSET = {"BTC": 1.1}
 
 
 def still_probability(x: np.ndarray, event: bool) -> float:
@@ -127,21 +122,18 @@ def apply(
     q: np.ndarray, px: float, x: np.ndarray | None, event: bool, asset: str = "BTC"
 ) -> np.ndarray:
     """Add the stillness point mass to a finished ladder ``q``."""
-    name = asset or "BTC"
-    gain = _GAIN_ASSET.get(name, GAIN)
-    kappa = _KAPPA_ASSET.get(name, KAPPA)
-    if x is None or gain <= 0.0:
+    if x is None or GAIN <= 0.0:
         return q
-    near = asset_spec(name).tick
+    near = asset_spec(asset or "BTC").tick
     m0 = float(np.count_nonzero(np.abs(q - px) < near)) / NUM_PERCENTILES
     x[_M0] = m0
-    p = gain * still_probability(x, event) - m0
+    p = GAIN * still_probability(x, event) - m0
     if not (p > 0.0):
         return q
     p = min(p, P_MAX)
     med = 0.5 * (float(q[49]) + float(q[50]))
     width = float(np.abs(q - med).sum()) / NUM_PERCENTILES
-    return mix_still(q, px, p, width, kappa, SHIFT, HOLE)
+    return mix_still(q, px, p, width, KAPPA, SHIFT, HOLE)
 
 
 def _i64(x: object) -> np.ndarray:

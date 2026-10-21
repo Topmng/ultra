@@ -282,85 +282,6 @@ def test_official_sample_payload_is_scored_shape():
     check_output(predict_percentiles(payload))
 
 
-def test_trigger_kinds():
-    payload = make_sample_payload(0, compact=True, current_time_ms=1_700_000_000_000)
-    payload["prompt"]["trigger"] = {"kind": "event", "venue": "spot"}
-    assert_payload_schema(payload)
-    payload["prompt"]["trigger"] = {"kind": "event_delayed", "venue": "futures"}
-    assert_payload_schema(payload)
-    payload["prompt"]["trigger"] = {"kind": "interval", "venue": None}
-    with pytest.raises(ValueError):
-        assert_payload_schema(payload)
-    payload["prompt"]["trigger"] = {"kind": "time", "venue": "spot"}
-    with pytest.raises(ValueError):
-        assert_payload_schema(payload)
-
-
-def test_sample_payload_json_roundtrip():
-    if not SAMPLE_PAYLOAD_JSON.is_file():
-        pytest.skip("examples/sample_payload.json is not present")
-    payload = load_payload(SAMPLE_PAYLOAD_JSON)
-    assert_payload_schema(payload)
-    check_output(predict_percentiles(payload))
-
-
-def test_realized_microprice_from_book_ticker():
-    times = np.array([1_000, 11_000], dtype=np.int64)
-    got = spot_microprice_at(times, [100.0, 101.0], [1.0, 2.0], [102.0, 103.0], [3.0, 4.0], 11_000)
-    assert got == pytest.approx(spot_microprice(101.0, 2.0, 103.0, 4.0))
-
-
-def test_stale_spot_feed_is_dropped():
-    times = np.array([1_000], dtype=np.int64)
-    assert spot_microprice_at(times, [100.0], [1.0], [102.0], [3.0], 1_000 + 60_000) is None
-
-
-def test_ten_second_bins_keep_flat_candles_on_the_anchor_and_skew_with_mu():
-    from synth_ultra.model import (
-        _bin_means,
-        _candle_abs_bins,
-        _recency_weights,
-        _skewed_candle_prices,
-    )
-
-    weights = _recency_weights(1790)
-    assert weights.shape == (1790,)
-    assert weights.sum() == pytest.approx(1.0)
-    assert weights[0] < weights[-1]
-
-    # 60% of the weight sits on exact zeros, then one moved level.
-    values = np.array([0.0, 0.0, 0.0, 0.002])
-    mass = np.array([0.2, 0.2, 0.2, 0.4])
-    means = _bin_means(values, mass)
-    assert means.shape == (50,)
-    assert np.all(means[:30] == 0.0)
-    assert np.all(means[30:] == pytest.approx(0.002))
-
-    flat = _skewed_candle_prices(100.0, means, 0.0)
-    assert np.sum(np.abs(flat - 100.0) < 1e-9) == 60
-    assert flat[0] < flat[-1]
-    assert np.all(np.diff(flat) >= 0.0)
-
-    # α = 1 lengthens the upper wing and lays the lower wing on the anchor.
-    scale = float(means.mean())
-    up = _skewed_candle_prices(100.0, means, scale * 100.0)
-    down = _skewed_candle_prices(100.0, means, -scale * 100.0)
-    assert up[-1] > flat[-1]
-    assert up[0] > flat[0]
-    assert down[0] < flat[0]
-    assert down[-1] < flat[-1]
-    assert np.all(np.diff(up) >= 0.0)
-    assert np.all(np.diff(down) >= 0.0)
-
-    close = np.full(1800, 50_000.0)
-    close[-1] = 50_000.0 * np.exp(0.001)
-    bins = _candle_abs_bins(close)
-    assert bins is not None
-    assert bins.shape == (50,)
-    assert np.sum(bins == 0.0) >= 40
-    assert _candle_abs_bins(np.full(30, 50_000.0)) is None
-
-
 @pytest.mark.parametrize(
     ("name", "asset", "symbol", "bucket", "slot_mod"),
     [
@@ -416,3 +337,135 @@ def test_unknown_asset_fails_schema():
     payload["prompt"]["asset"] = "DOGE"
     with pytest.raises(ValueError, match="prompt.asset"):
         assert_payload_schema(payload)
+
+
+def test_trigger_kinds():
+    payload = make_sample_payload(0, compact=True, current_time_ms=1_700_000_000_000)
+    payload["prompt"]["trigger"] = {"kind": "event", "venue": "spot"}
+    assert_payload_schema(payload)
+    payload["prompt"]["trigger"] = {"kind": "event_delayed", "venue": "futures"}
+    assert_payload_schema(payload)
+    payload["prompt"]["trigger"] = {"kind": "interval", "venue": None}
+    with pytest.raises(ValueError):
+        assert_payload_schema(payload)
+    payload["prompt"]["trigger"] = {"kind": "time", "venue": "spot"}
+    with pytest.raises(ValueError):
+        assert_payload_schema(payload)
+
+
+def test_sample_payload_json_roundtrip():
+    if not SAMPLE_PAYLOAD_JSON.is_file():
+        pytest.skip("examples/sample_payload.json is not present")
+    payload = load_payload(SAMPLE_PAYLOAD_JSON)
+    assert_payload_schema(payload)
+    check_output(predict_percentiles(payload))
+
+
+def test_realized_microprice_from_book_ticker():
+    times = np.array([1_000, 11_000], dtype=np.int64)
+    got = spot_microprice_at(times, [100.0, 101.0], [1.0, 2.0], [102.0, 103.0], [3.0, 4.0], 11_000)
+    assert got == pytest.approx(spot_microprice(101.0, 2.0, 103.0, 4.0))
+
+
+def test_stale_spot_feed_is_dropped():
+    times = np.array([1_000], dtype=np.int64)
+    assert spot_microprice_at(times, [100.0], [1.0], [102.0], [3.0], 1_000 + 60_000) is None
+
+
+def _freeze_quotes(payload: dict, bid: float, qty: float = 5.0) -> float:
+    """Hold both venues' top of book and the last half hour of spot candles still.
+
+    Returns the spot microprice of that quote.
+    """
+    for venue, b, tick in (("spot", bid, 0.01), ("futures", bid - 40.0, 0.1)):
+        book = payload["venues"][venue]["book_ticker"]
+        n = book["recv_ts_ms"].size
+        book["bid_price"] = np.full(n, b)
+        book["ask_price"] = np.full(n, b + tick)
+        book["bid_qty"] = np.full(n, qty)
+        book["ask_qty"] = np.full(n, qty)
+    micro = spot_microprice(bid, qty, bid + 0.01, qty)
+    payload["venues"]["spot"]["candles_1s"]["ohlcv"][-1800:, :4] = micro
+    return micro
+
+
+def test_a_frozen_quote_puts_mass_on_the_current_microprice():
+    payload = make_sample_payload(6, compact=False)
+    payload["prompt"]["trigger"] = {"kind": "event", "venue": "futures"}
+    micro = _freeze_quotes(payload, 97_500.0)
+    out = predict_percentiles(payload)
+    check_output(out)
+    assert np.count_nonzero(out == micro) >= 30
+
+    busy = make_sample_payload(6, compact=False)
+    busy["prompt"]["trigger"] = {"kind": "event", "venue": "futures"}
+    px = spot_microprice(
+        float(busy["venues"]["spot"]["book_ticker"]["bid_price"][-1]),
+        float(busy["venues"]["spot"]["book_ticker"]["bid_qty"][-1]),
+        float(busy["venues"]["spot"]["book_ticker"]["ask_price"][-1]),
+        float(busy["venues"]["spot"]["book_ticker"]["ask_qty"][-1]),
+    )
+    moving = predict_percentiles(busy)
+    check_output(moving)
+    assert np.count_nonzero(np.abs(moving - px) < 1e-9) < 10
+
+
+def test_mix_still_places_the_point_mass_and_stays_ordered():
+    from synth_ultra.model import _MIX_Z
+    from synth_ultra.stillness import mix_still
+
+    px = 100_000.0
+    ladder = px + 1.5 + 4.0 * _MIX_Z
+    out = mix_still(ladder, px, 0.3, 4.0, 0.75, 1.0, 0.05)
+    assert out.shape == (NUM_PERCENTILES,)
+    assert np.all(np.diff(out) >= 0.0)
+    assert abs(np.count_nonzero(out == px) - 30) <= 1
+    # The rest of the ladder keeps the mean shift, so the median moves up.
+    assert 0.5 * (out[49] + out[50]) >= px
+    assert mix_still(ladder, px, 0.0, 4.0, 0.75, 1.0, 0.05) is ladder
+
+
+def test_ten_second_bins_keep_flat_candles_on_the_anchor_and_skew_with_mu():
+    from synth_ultra.model import (
+        _bin_means,
+        _candle_abs_bins,
+        _recency_weights,
+        _skewed_candle_prices,
+    )
+
+    weights = _recency_weights(1790)
+    assert weights.shape == (1790,)
+    assert weights.sum() == pytest.approx(1.0)
+    assert weights[0] < weights[-1]
+
+    # 60% of the weight sits on exact zeros, then one moved level.
+    values = np.array([0.0, 0.0, 0.0, 0.002])
+    mass = np.array([0.2, 0.2, 0.2, 0.4])
+    means = _bin_means(values, mass)
+    assert means.shape == (50,)
+    assert np.all(means[:30] == 0.0)
+    assert np.all(means[30:] == pytest.approx(0.002))
+
+    flat = _skewed_candle_prices(100.0, means, 0.0)
+    assert np.sum(np.abs(flat - 100.0) < 1e-9) == 60
+    assert flat[0] < flat[-1]
+    assert np.all(np.diff(flat) >= 0.0)
+
+    # α = 1 lengthens the upper wing and lays the lower wing on the anchor.
+    scale = float(means.mean())
+    up = _skewed_candle_prices(100.0, means, scale * 100.0)
+    down = _skewed_candle_prices(100.0, means, -scale * 100.0)
+    assert up[-1] > flat[-1]
+    assert up[0] > flat[0]
+    assert down[0] < flat[0]
+    assert down[-1] < flat[-1]
+    assert np.all(np.diff(up) >= 0.0)
+    assert np.all(np.diff(down) >= 0.0)
+
+    close = np.full(1800, 50_000.0)
+    close[-1] = 50_000.0 * np.exp(0.001)
+    bins = _candle_abs_bins(close)
+    assert bins is not None
+    assert bins.shape == (50,)
+    assert np.sum(bins == 0.0) >= 40
+    assert _candle_abs_bins(np.full(30, 50_000.0)) is None

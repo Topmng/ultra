@@ -7,19 +7,22 @@ import pytest
 
 from fetch_live import save_payload
 from fetch_payload import (
+    DEFAULT_DATABASE,
     TradeGroupDetector,
     clock_interval_ms,
     delete_captures_older_than,
     event_window_boundary,
     interval_to_ms,
     last_spot_book_in_window,
+    main,
     moved_more_than_one_tick,
     next_time_boundary,
     select_depth_pair,
+    take_qualifying_move,
 )
 from harness.payload import load_payload, load_payload_scoring, make_sample_payload
 from harness.saved_pairs import book_path, payload_path
-from harness.validate import validate_saved_pairs
+from harness.validate import ValidationError, validate_saved_pairs
 from synth_ultra.model import predict_percentiles
 
 
@@ -48,16 +51,35 @@ def test_move_is_more_than_one_tick():
     assert moved_more_than_one_tick(100.0, 100.02, 0.01) is True
 
 
-def test_event_window_opens_ten_seconds_after_the_boundary():
+def test_event_window_opens_10_25s_after_the_asset_slot():
     boundary = 1_700_000_000_000
     assert boundary % 20_000 == 0
-    assert event_window_boundary(boundary + 9_999) is None
-    assert event_window_boundary(boundary + 10_000) == boundary
-    assert event_window_boundary(boundary + 14_999) == boundary
-    assert event_window_boundary(boundary + 15_000) is None
-    assert event_window_boundary(boundary + 30_000) == boundary + 20_000
+    assert event_window_boundary(boundary + 10_249) is None
+    assert event_window_boundary(boundary + 10_250) == boundary
+    assert event_window_boundary(boundary + 14_249) == boundary
+    assert event_window_boundary(boundary + 14_250) is None
+    assert event_window_boundary(boundary + 30_250) == boundary + 20_000
     assert next_time_boundary(boundary + 1) == boundary + 20_000
     assert next_time_boundary(boundary) == boundary
+    eth = boundary + 5_000
+    assert next_time_boundary(eth, offset_ms=5_000) == eth
+    assert next_time_boundary(eth + 1, offset_ms=5_000) == eth + 20_000
+    assert event_window_boundary(eth + 10_249, offset_ms=5_000) is None
+    assert event_window_boundary(eth + 10_250, offset_ms=5_000) == eth
+    assert event_window_boundary(eth + 14_249, offset_ms=5_000) == eth
+    assert event_window_boundary(eth + 14_250, offset_ms=5_000) is None
+
+
+def test_qualifying_move_is_taken_with_a_coin_flip():
+    import random
+
+    rng = random.Random(0)
+    taken: set[int] = set()
+    accepted = [take_qualifying_move(rng, boundary, taken) for boundary in range(40)]
+    assert any(accepted)
+    assert not all(accepted)
+    held = next(boundary for boundary, ok in enumerate(accepted) if ok)
+    assert take_qualifying_move(rng, held, taken) is False
 
 
 def test_trade_group_emits_the_group_receive_time():
@@ -94,7 +116,7 @@ def test_interval_milliseconds():
 
 
 def test_test_clock_keeps_every_tenth_live_cycle():
-    """200s is every tenth live boundary, and that boundary's 5s window only."""
+    """200s is every tenth live boundary, and that boundary's 4s window only."""
     assert clock_interval_ms(20) == 20_000
     assert clock_interval_ms(200) == 200_000
     with pytest.raises(ValueError):
@@ -103,12 +125,12 @@ def test_test_clock_keeps_every_tenth_live_cycle():
     boundary = 1_700_000_000_000
     assert boundary % 200_000 == 0
     clock_ms = clock_interval_ms(200)
-    assert event_window_boundary(boundary + 9_999, clock_ms=clock_ms) is None
-    assert event_window_boundary(boundary + 10_000, clock_ms=clock_ms) == boundary
-    assert event_window_boundary(boundary + 14_999, clock_ms=clock_ms) == boundary
-    assert event_window_boundary(boundary + 15_000, clock_ms=clock_ms) is None
-    assert event_window_boundary(boundary + 30_000, clock_ms=clock_ms) is None
-    assert event_window_boundary(boundary + 210_000, clock_ms=clock_ms) == boundary + 200_000
+    assert event_window_boundary(boundary + 10_249, clock_ms=clock_ms) is None
+    assert event_window_boundary(boundary + 10_250, clock_ms=clock_ms) == boundary
+    assert event_window_boundary(boundary + 14_249, clock_ms=clock_ms) == boundary
+    assert event_window_boundary(boundary + 14_250, clock_ms=clock_ms) is None
+    assert event_window_boundary(boundary + 30_250, clock_ms=clock_ms) is None
+    assert event_window_boundary(boundary + 210_250, clock_ms=clock_ms) == boundary + 200_000
     assert next_time_boundary(boundary + 1, clock_ms=clock_ms) == boundary + 200_000
     assert next_time_boundary(boundary, clock_ms=clock_ms) == boundary
 
@@ -183,8 +205,10 @@ def test_nul_book_is_skipped(tmp_path):
     book_path(bad).write_bytes(b"\x00" * 225)
     report = validate_saved_pairs(tmp_path, warmup=0, rounds=1)
     assert report["n"] == 1
-    assert report["n_unreadable"] == 1
     assert report["n_scored"] == 1
+    assert report["n_unreadable"] == 0
+    assert good.is_dir()
+    assert not bad.exists()
 
 
 def test_stale_saved_book_is_dropped(tmp_path):
@@ -206,10 +230,9 @@ def test_stale_saved_book_is_dropped(tmp_path):
         ),
         encoding="utf-8",
     )
-    report = validate_saved_pairs(tmp_path, warmup=0, rounds=1)
-    assert report["n"] == 1
-    assert report["n_scored"] == 0
-    assert report["crps"] is None
+    with pytest.raises(ValidationError, match="no scorable"):
+        validate_saved_pairs(tmp_path, warmup=0, rounds=1)
+    assert not folder.exists()
 
 
 def test_scoring_load_skips_depth_updates_and_keeps_the_forecast(tmp_path):
@@ -222,3 +245,24 @@ def test_scoring_load_skips_depth_updates_and_keeps_the_forecast(tmp_path):
     assert fast["venues"]["spot"]["depth_updates"] == []
     assert fast["venues"]["futures"]["depth_updates"] == []
     assert np.array_equal(predict_percentiles(full), predict_percentiles(fast))
+
+
+def test_asset_flag_selects_symbol_schedule_and_database(monkeypatch, tmp_path):
+    seen: dict = {}
+
+    def fake_run(**kwargs):
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("fetch_payload.run_capture", fake_run)
+    assert main(["--asset", "eth", "--count", "1"]) == 0
+    assert seen["asset"] == "ETH"
+    assert seen["database"] == DEFAULT_DATABASE / "ETH"
+    assert main(["--asset", "SOL", "--count", "1", "--database", str(tmp_path)]) == 0
+    assert seen["asset"] == "SOL"
+    assert seen["database"] == tmp_path
+    assert main(["--asset", "BTC", "--count", "1"]) == 0
+    assert seen["asset"] == "BTC"
+    assert seen["database"] == DEFAULT_DATABASE / "BTC"
+    with pytest.raises(SystemExit):
+        main(["--asset", "DOGE", "--count", "1"])

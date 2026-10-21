@@ -10,9 +10,11 @@ mixture path the fitted drift is scaled to 85% and 60% of the last
 one-second move is added. Top-of-book imbalance shifts the center by a
 fraction of the width, more so after a trade print, and a trade print also
 moves the forecast along the last second of futures taker flow, then
-pulls back the spent 1s futures micro-move. Finally ``stillness`` puts a
+pulls back the spent 1s futures micro-move. ``stillness`` then puts a
 point mass on the current microprice, sized by how still the live spot
-and futures quotes have been.
+and futures quotes have been, and ``layer`` moves and rescales the rest of
+the ladder along live book and trade signals.
+Each asset sets its own knob values from ``asset_knobs`` before forecasting.
 Never-raise fallback so a non-answer is not charged under FAQ.md.
 
 Every hour-of-candles statistic is read from one pass over the 10-second
@@ -24,11 +26,15 @@ from __future__ import annotations
 
 import gc
 import math
+import sys
 
 import numpy as np
 
+from synth_ultra import stillness as _stillness
+from synth_ultra.asset_knobs import ASSET_KNOBS as _ASSET_KNOBS
 from synth_ultra.constants import HORIZON_SECONDS, NUM_PERCENTILES, asset_spec, price_scale
 from synth_ultra.features import extract, reference_price
+from synth_ultra.layer import apply as apply_layer
 from synth_ultra.season_table import SEAS_ABS as _SEAS_ABS
 from synth_ultra.season_table import SEAS_REL as _SEAS_REL
 from synth_ultra.stillness import apply as apply_stillness
@@ -63,7 +69,7 @@ _B_MU = np.array(
         0.2225417214564695,
         -0.09424387369323395,
         0.06611178032601009,
-        -0.002,
+        0.0,
         1.3194603589745686e-05,
         9.25776900504624e-06,
         6.419523696500204e-06,
@@ -813,6 +819,7 @@ def _abs_vec(f: dict[str, float], vol10: float, vol_fast10: float) -> np.ndarray
 # season_table.py. The 1-minute price file is not read at inference.
 _SEAS_W = 0.35
 _SEAS_CLIP = 0.35
+_SEAS_LEVEL = 1.0
 # Weekend slots quieter than this fraction of the same weekday hour trust
 # the payload's own 10s book quantiles more.
 _SEAS_QUIET_REL = 0.70
@@ -848,7 +855,7 @@ def _season_scale(sigma_px: float, px: float, now_ms: int) -> float:
         or int(now_ms) < 0
     ):
         return sigma
-    seas = price * float(_SEAS_ABS[_slot_index(now_ms)]) / _Z_ABS
+    seas = price * float(_SEAS_ABS[_slot_index(now_ms)]) / _Z_ABS * _SEAS_LEVEL
     if not math.isfinite(seas) or seas <= 0.0:
         return sigma
     adj = _clip(_SEAS_W * (math.log(seas) - math.log(sigma)), -_SEAS_CLIP, _SEAS_CLIP)
@@ -1313,6 +1320,7 @@ def predict_percentiles(payload: dict) -> np.ndarray:
         now_ms = int(prompt.get("current_time_ms") or 0)
         trigger = str((prompt.get("trigger") or {}).get("kind") or "time")
         asset = str(prompt.get("asset") or "BTC")
+        _use_knobs(asset)
         out = _forecast_from_parts(
             f,
             closes,
@@ -1430,9 +1438,9 @@ def _live_width(
 
 
 # Residual scale after the BTC ladder is expressed in each asset's own units.
-# Picked on the earlier half of the saved prompts; the later half agreed.
 # ETH is closest to BTC's log-vol, SOL and XRP run wider than that fit.
-_WIDTH_ASSET = {"ETH": 1.25, "SOL": 1.50, "XRP": 1.60}
+# SOL and XRP were re-chosen together with their asset_knobs values.
+_WIDTH_ASSET = {"ETH": 1.25, "SOL": 1.3538, "XRP": 1.568}
 
 
 def _asset_width(q: np.ndarray, anchor: float, asset: str, scale: float) -> np.ndarray:
@@ -1483,71 +1491,28 @@ def _post_layers(
     q = apply_stillness(q, anchor, x, event, asset=asset)
     q = _live_width(q, closes, anchor, scale, _atom_band(asset, scale))
     q = _asset_width(q, anchor, asset, scale)
-    q = _vol_blend(q, f, asset)
-    q = _remap_quantiles(q, asset)
+    q = apply_layer(q, anchor, asset, trigger, payload, now_ms, f)
     return q if _valid(q) else out
 
 
-# Median-centered mixture scaled by the asset's own 1-second vol, mixed into
-# the finished ladder. k is the vol multiple, a is the mixture share. Chosen
-# so every 24-hour window of the saved prompts scores lower. BTC is left on
-# the feature ladder; a vol mix there raised the loud windows.
-_VOL_BLEND = {"ETH": (0.80, 0.04), "SOL": (0.70, 0.35), "XRP": (0.80, 0.14)}
+# Each asset's knob values. The constants above are the shared fallback for
+# any knob an asset does not list. Predictions run one at a time (the
+# stillness buffers are module-level too), so the knobs are set per call.
+_KNOB_HOMES = {"model": sys.modules[__name__], "stillness": _stillness}
+_KNOB_KEYS = tuple(sorted({k for table in _ASSET_KNOBS.values() for k in table}))
+_KNOB_SLOTS = tuple((_KNOB_HOMES[k.split(".", 1)[0]], k.split(".", 1)[1]) for k in _KNOB_KEYS)
+_KNOB_DEFAULTS = tuple(getattr(home, attr) for home, attr in _KNOB_SLOTS)
+_knob_asset: str | None = None
 
 
-def _vol_blend(q: np.ndarray, f: dict[str, float], asset: str) -> np.ndarray:
-    """Pull an alt ladder toward a short-horizon mixture, keeping its median."""
-    spec = _VOL_BLEND.get(asset)
-    if spec is None:
-        return q
-    k, share = spec
-    vol = float(f.get("vol_1s") or 0.0)
-    px = float(f.get("price") or 0.0)
-    if not (vol > 0.0 and px > 0.0 and 0.0 < share < 1.0):
-        return q
-    sig = float(k) * px * vol * _SQRT_H
-    if not math.isfinite(sig) or sig <= 0.0:
-        return q
-    med = 0.5 * (float(q[49]) + float(q[50]))
-    if not math.isfinite(med):
-        return q
-    out = (1.0 - share) * q + share * (med + sig * _MIX_Z)
-    np.maximum(out, _MIN_PRICE, out=out)
-    np.maximum.accumulate(out, out=out)
-    return out
-
-
-# Probability warp of the finished BTC ladder. The new quantile at tau is the
-# old quantile at g(tau), with g fit on the earlier saved prompts and checked
-# on the later ones. It widens the body and shifts the center down a fraction
-# of the width. ETH, SOL, and XRP had no warp that lowered every 24-hour window.
-_REMAP_KNOTS = np.array([0.0, 0.05, 0.15, 0.30, 0.50, 0.70, 0.85, 0.95, 1.0])
-_REMAP_G = {
-    "BTC": np.array([0.0, 0.05, 0.13, 0.265, 0.465, 0.715, 0.87, 0.945, 1.0]),
-}
-
-
-def _remap_index(g_knots: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    g = np.interp(_TAU, _REMAP_KNOTS, g_knots)
-    g = np.clip(g, float(_TAU[0]), float(_TAU[-1]))
-    pos = (g - _TAU[0]) / (_TAU[1] - _TAU[0])
-    i0 = np.clip(np.floor(pos).astype(np.int64), 0, NUM_PERCENTILES - 2)
-    return i0, pos - i0
-
-
-_REMAP_INDEX = {name: _remap_index(knots) for name, knots in _REMAP_G.items()}
-
-
-def _remap_quantiles(q: np.ndarray, asset: str) -> np.ndarray:
-    """Read the ladder at a warped probability grid."""
-    index = _REMAP_INDEX.get(asset)
-    if index is None:
-        return q
-    i0, frac = index
-    out = q[i0] * (1.0 - frac) + q[i0 + 1] * frac
-    np.maximum(out, _MIN_PRICE, out=out)
-    np.maximum.accumulate(out, out=out)
-    return out
+def _use_knobs(asset: str) -> None:
+    global _knob_asset
+    if asset == _knob_asset:
+        return
+    table = _ASSET_KNOBS.get(asset, {})
+    for key, (home, attr), default in zip(_KNOB_KEYS, _KNOB_SLOTS, _KNOB_DEFAULTS):
+        setattr(home, attr, table.get(key, default))
+    _knob_asset = asset
 
 
 def _warmup_payload(trigger: str) -> dict:
