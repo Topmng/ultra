@@ -22,7 +22,7 @@ from fetch_payload import (
 )
 from harness.payload import load_payload, load_payload_scoring, make_sample_payload
 from harness.saved_pairs import book_path, payload_path
-from harness.validate import ValidationError, validate_saved_pairs
+from harness.validate import validate_saved_pairs
 from synth_ultra.model import predict_percentiles
 
 
@@ -205,10 +205,8 @@ def test_nul_book_is_skipped(tmp_path):
     book_path(bad).write_bytes(b"\x00" * 225)
     report = validate_saved_pairs(tmp_path, warmup=0, rounds=1)
     assert report["n"] == 1
+    assert report["n_unreadable"] == 1
     assert report["n_scored"] == 1
-    assert report["n_unreadable"] == 0
-    assert good.is_dir()
-    assert not bad.exists()
 
 
 def test_stale_saved_book_is_dropped(tmp_path):
@@ -230,9 +228,10 @@ def test_stale_saved_book_is_dropped(tmp_path):
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ValidationError, match="no scorable"):
-        validate_saved_pairs(tmp_path, warmup=0, rounds=1)
-    assert not folder.exists()
+    report = validate_saved_pairs(tmp_path, warmup=0, rounds=1)
+    assert report["n"] == 1
+    assert report["n_scored"] == 0
+    assert report["crps"] is None
 
 
 def test_scoring_load_skips_depth_updates_and_keeps_the_forecast(tmp_path):

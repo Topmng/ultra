@@ -8,7 +8,6 @@ Run the CLI from the repo root:
 from __future__ import annotations
 
 import csv
-import shutil
 import statistics
 import sys
 import time
@@ -62,15 +61,31 @@ def write_crps_csv(path: Path, reports: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(("start", "crps", "predict_ms"))
-        for one in reports:
+        writer.writerow(
+            (
+                "test",
+                "current_time_ms",
+                "start",
+                "target",
+                "book_recv_ts_ms",
+                "realized",
+                "crps",
+                "predict_ms",
+            )
+        )
+        for i, one in enumerate(reports, start=1):
             crps = one.get("crps")
-            if crps is None:
-                continue
+            realized = one.get("realized_price")
+            book_recv = one.get("book_recv_ts_ms")
             writer.writerow(
                 (
+                    i,
+                    one.get("current_time_ms", ""),
                     one["current_time_utc"],
-                    f"{float(crps):.6f}",
+                    one["target_utc"],
+                    "" if book_recv is None else book_recv,
+                    "" if realized is None else f"{float(realized):.6f}",
+                    "" if crps is None else f"{float(crps):.6f}",
                     f"{float(one['max_ms']):.3f}",
                 )
             )
@@ -385,31 +400,19 @@ def validate_saved_pairs(
     reports: list[dict[str, Any]] = []
     all_times: list[float] = []
     asset = "BTC"
-    for _i, (folder, payload_file, book_file) in enumerate(pairs, start=1):
+    n_unreadable = 0
+    for i, (_folder, payload_file, book_file) in enumerate(pairs, start=1):
         payload = load_payload(payload_file)
         try:
             book = load_book(book_file)
-        except BookReadError:
-            if folder.is_dir():
-                shutil.rmtree(folder)
-                print(
-                    f"deleted {folder.resolve()}  (unreadable spot book)",
-                    flush=True,
-                )
+        except BookReadError as exc:
+            n_unreadable += 1
+            print(f"skip test {i}  {_folder.name}  {exc}", flush=True)
             continue
         asset = str(payload["prompt"].get("asset") or asset)
         anchor = int(payload["prompt"]["current_time_ms"])
         horizon = int(payload["prompt"].get("horizon_seconds", HORIZON_SECONDS))
         realized = realized_from_saved_book(book, anchor, horizon)
-        if realized is None:
-            if folder.is_dir():
-                shutil.rmtree(folder)
-                print(
-                    f"deleted {folder.resolve()}  "
-                    "(spot book-ticker not live at horizon)",
-                    flush=True,
-                )
-            continue
         # Touch arrays once outside the timed window so first-page faults from
         # freshly loaded payloads are not counted as model latency.
         predict_percentiles(payload)
@@ -425,23 +428,25 @@ def validate_saved_pairs(
         reports.append(one)
         all_times.extend(one["predict_times_s"])
         if on_test is not None:
-            on_test(len(reports), one)
+            on_test(i, one)
 
     if not reports:
-        raise ValidationError(f"no scorable payload/book pairs under {database}")
+        detail = f"; {n_unreadable} unreadable" if n_unreadable else ""
+        raise ValidationError(f"no readable payload/book pairs under {database}{detail}")
 
     median = statistics.median(all_times)
     p95 = statistics.quantiles(all_times, n=20)[18] if len(all_times) >= 20 else max(all_times)
-    crps_vals = [float(item["crps"]) for item in reports]
+    scored = [item for item in reports if item["crps"] is not None]
+    crps_vals = [float(item["crps"]) for item in scored]
     first = reports[0]
     last = reports[-1]
-    display = first
+    display = scored[0] if scored else first
     report: dict[str, Any] = {
         "ok": True,
         "n": len(reports),
-        "n_scored": len(reports),
-        "n_dropped": 0,
-        "n_unreadable": 0,
+        "n_scored": len(scored),
+        "n_dropped": len(reports) - len(scored),
+        "n_unreadable": n_unreadable,
         "time_interval": 0,
         "time_length": len(reports),
         "median_ms": median * 1000.0,

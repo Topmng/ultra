@@ -194,12 +194,18 @@ def _run(args: argparse.Namespace) -> int:
         return 1
 
     print()
+    dropped = int(report.get("n_dropped") or 0)
     scored = int(report.get("n_scored") or 0)
+    unreadable = int(report.get("n_unreadable") or 0)
     if report["crps"] is None:
-        print(f"average CRPS=dropped  scored=0")
+        extra = f"  unreadable={unreadable}" if unreadable else ""
+        print(f"average CRPS=dropped  scored=0  dropped={dropped}{extra}")
         print(f"maximum predict time={report['max_ms']:.3f} ms")
     else:
-        print(f"average CRPS={report['crps']:.6f}  scored={scored}")
+        extra = f"  scored={scored}  dropped={dropped}" if dropped else ""
+        if unreadable:
+            extra += f"  unreadable={unreadable}"
+        print(f"average CRPS={report['crps']:.6f}{extra}")
         print(f"maximum predict time={report['max_ms']:.3f} ms")
     crps_path = crps_csv_path(str(report["asset"]))
     write_crps_csv(crps_path, report["reports"])

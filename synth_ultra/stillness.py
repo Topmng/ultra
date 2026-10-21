@@ -19,18 +19,27 @@ import math
 
 import numpy as np
 
-from synth_ultra.constants import BTC_REF_PX, NUM_PERCENTILES, asset_spec
+from synth_ultra.config import BTC_REF_PX, NUM_PERCENTILES, REFERENCE_ASSET, TAU, asset_param
+from synth_ultra.config import STILL_FUT_STEP as _FUT_STEP
+from synth_ultra.config import STILL_GAIN as GAIN
+from synth_ultra.config import STILL_GRID_MS as _GRID_MS
+from synth_ultra.config import STILL_GRID_N as _GRID_N
+from synth_ultra.config import STILL_HOLE as HOLE
+from synth_ultra.config import STILL_KAPPA as KAPPA
+from synth_ultra.config import STILL_P_MAX as P_MAX
+from synth_ultra.config import STILL_RANGE_LONG as _RANGE_LONG
+from synth_ultra.config import STILL_RANGE_SHORT as _RANGE_SHORT
+from synth_ultra.config import STILL_RANGE_TICK as _RANGE_TICK
+from synth_ultra.config import STILL_SHIFT as SHIFT
+from synth_ultra.config import STILL_SPOT_STEP as _SPOT_STEP
+from synth_ultra.config import STILL_W_EVENT as W_EVENT
+from synth_ultra.config import STILL_W_TIME as W_TIME
+from synth_ultra.constants import asset_spec
 
-_GRID_MS = 100
-_GRID_N = 600
+# GAIN, KAPPA, SHIFT, HOLE, P_MAX, W_TIME and W_EVENT are the config values,
+# re-exported for research scripts. ``apply`` reads the per-asset ones.
 _GRID_OFF = np.arange(-(_GRID_N - 1) * _GRID_MS, 1, _GRID_MS, dtype=np.int64)
 _WIN = 10_000 // _GRID_MS
-# Changes of twice the mid. Spot moves in 0.01 ticks; futures in 0.1.
-_SPOT_STEP = 0.008
-_FUT_STEP = 0.08
-_RANGE_TICK = 0.011
-_RANGE_LONG = 1790
-_RANGE_SHORT = 290
 
 FEATURES = (
     "p0book",
@@ -48,64 +57,13 @@ FEATURES = (
     "m0",
 )
 
-_TAU = (2.0 * np.arange(1, NUM_PERCENTILES + 1) - 1.0) / 200.0
+_TAU = TAU
 _M0 = FEATURES.index("m0")
 _XBUF = np.empty(len(FEATURES), dtype=np.float64)
 _R = np.empty(NUM_PERCENTILES, dtype=np.float64)
 _OUT = np.empty(NUM_PERCENTILES, dtype=np.float64)
 _POS = np.empty(NUM_PERCENTILES, dtype=np.float64)
 _I0 = np.empty(NUM_PERCENTILES, dtype=np.int64)
-
-# Logistic weights, intercept first, then FEATURES order. Fit by
-# scripts/fit_stillness.py on the saved prompts; clock and trade-triggered
-# prompts each have their own vector.
-W_TIME = np.array(
-    [
-        -4.61846527451775,
-        0.17034772984186247,
-        0.2813703561617492,
-        -0.15965766031065734,
-        -0.04949323887833651,
-        0.6605209888903941,
-        0.13005700670299267,
-        -20.758785373235124,
-        -0.053866749363991946,
-        -0.40563421464038446,
-        1.9722942449642995,
-        -0.21931392073370692,
-        -0.4799491646634374,
-        -1.0101467322622217,
-    ],
-    dtype=np.float64,
-)
-W_EVENT = np.array(
-    [
-        -5.293526458905508,
-        1.2359207801555567,
-        -0.7657115123577866,
-        -0.35387194617541284,
-        -0.2549507079896938,
-        1.0323707288541988,
-        0.19539287504904634,
-        -1.8838370215557418,
-        0.017228787450030474,
-        -0.41789201765064954,
-        -0.16554390432665644,
-        1.3447109825428714,
-        -0.48082099995511424,
-        -8.983843865291522,
-    ],
-    dtype=np.float64,
-)
-# The added mass is GAIN * P(still) less the mass the ladder already puts
-# within a cent of the price, capped at P_MAX. The remaining ladder widens by
-# 1 + KAPPA * p, keeps SHIFT of its mean offset, and leaves a band of about
-# HOLE widths around the price.
-GAIN = 1.0
-P_MAX = 0.9
-KAPPA = 0.75
-SHIFT = 1.0
-HOLE = 0.05
 
 
 def still_probability(x: np.ndarray, event: bool) -> float:
@@ -122,18 +80,28 @@ def apply(
     q: np.ndarray, px: float, x: np.ndarray | None, event: bool, asset: str = "BTC"
 ) -> np.ndarray:
     """Add the stillness point mass to a finished ladder ``q``."""
-    if x is None or GAIN <= 0.0:
+    asset = asset or REFERENCE_ASSET
+    gain = asset_param(asset, "STILL_GAIN")
+    if x is None or gain <= 0.0:
         return q
-    near = asset_spec(asset or "BTC").tick
+    near = asset_spec(asset).tick
     m0 = float(np.count_nonzero(np.abs(q - px) < near)) / NUM_PERCENTILES
     x[_M0] = m0
-    p = GAIN * still_probability(x, event) - m0
+    p = gain * still_probability(x, event) - m0
     if not (p > 0.0):
         return q
     p = min(p, P_MAX)
     med = 0.5 * (float(q[49]) + float(q[50]))
     width = float(np.abs(q - med).sum()) / NUM_PERCENTILES
-    return mix_still(q, px, p, width, KAPPA, SHIFT, HOLE)
+    return mix_still(
+        q,
+        px,
+        p,
+        width,
+        asset_param(asset, "STILL_KAPPA"),
+        asset_param(asset, "STILL_SHIFT"),
+        asset_param(asset, "STILL_HOLE"),
+    )
 
 
 def _i64(x: object) -> np.ndarray:
@@ -221,7 +189,7 @@ def _qty_unit(asset: str, px: float) -> float:
     in coins, ``log1p(qty)`` saturates the logistic and the point mass stays
     on the touch after the price has already left.
     """
-    if str(asset or "BTC") == "BTC" or not math.isfinite(px) or px <= 0.0:
+    if str(asset or REFERENCE_ASSET) == REFERENCE_ASSET or not math.isfinite(px) or px <= 0.0:
         return 1.0
     return px / BTC_REF_PX
 
@@ -232,7 +200,7 @@ def _asset_steps(asset: str) -> tuple[float, float, float, float]:
     BTC keeps the fitted dollar thresholds. A one-tick move on ETH, SOL, or
     XRP is measured the same way, in that asset's own tick.
     """
-    spec = asset_spec(asset or "BTC")
+    spec = asset_spec(asset or REFERENCE_ASSET)
     tick_scale = spec.tick / 0.01
     fut_scale = spec.futures_tick / 0.1
     return _SPOT_STEP * tick_scale, _FUT_STEP * fut_scale, _RANGE_TICK * tick_scale, 0.01 / spec.tick

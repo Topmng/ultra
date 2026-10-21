@@ -10,11 +10,11 @@ mixture path the fitted drift is scaled to 85% and 60% of the last
 one-second move is added. Top-of-book imbalance shifts the center by a
 fraction of the width, more so after a trade print, and a trade print also
 moves the forecast along the last second of futures taker flow, then
-pulls back the spent 1s futures micro-move. ``stillness`` then puts a
+pulls back the spent 1s futures micro-move. Finally ``stillness`` puts a
 point mass on the current microprice, sized by how still the live spot
-and futures quotes have been, and ``layer`` moves and rescales the rest of
-the ladder along live book and trade signals.
-Each asset sets its own knob values from ``asset_knobs`` before forecasting.
+and futures quotes have been. On a trade print the moved part of the ladder
+is then re-centred toward the last spot trade, which the quote can lag.
+Constants and per-asset values live in ``synth_ultra.config``.
 Never-raise fallback so a non-answer is not charged under FAQ.md.
 
 Every hour-of-candles statistic is read from one pass over the 10-second
@@ -26,217 +26,105 @@ from __future__ import annotations
 
 import gc
 import math
-import sys
 
 import numpy as np
 
-from synth_ultra import stillness as _stillness
-from synth_ultra.asset_knobs import ASSET_KNOBS as _ASSET_KNOBS
-from synth_ultra.constants import HORIZON_SECONDS, NUM_PERCENTILES, asset_spec, price_scale
+from synth_ultra.config import ACT_EPS as _ACT_EPS
+from synth_ultra.config import ACT_FAST as _ACT_FAST
+from synth_ultra.config import ATOM as _ATOM
+from synth_ultra.config import B_ABS as _B_ABS
+from synth_ultra.config import B_MU as _B_MU
+from synth_ultra.config import BAND_K as _BAND_K
+from synth_ultra.config import BLEND_BETA as _BLEND_BETA
+from synth_ultra.config import BLEND_PIVOT as _BLEND_PIVOT
+from synth_ultra.config import BLEND_REALIZED_POW as _BLEND_REALIZED_POW
+from synth_ultra.config import BLEND_TEMP as _BLEND_TEMP
+from synth_ultra.config import BOOK_CAP as _BOOK_CAP
+from synth_ultra.config import BOOK_MIN_GAP_MS as _BOOK_MIN_GAP_MS
+from synth_ultra.config import BOOK_MIN_PAIRS as _BOOK_MIN_PAIRS
+from synth_ultra.config import BOOK_MIN_TICKS as _BOOK_MIN_TICKS
+from synth_ultra.config import BOOK_PAIRS as _BOOK_PAIRS
+from synth_ultra.config import BOOK_PIVOT as _BOOK_PIVOT
+from synth_ultra.config import BOOK_SLOPE as _BOOK_SLOPE
+from synth_ultra.config import C1_TANH_SCALE as _C1_TANH_SCALE
+from synth_ultra.config import CALM_CORE as _CALM_CORE
+from synth_ultra.config import CANDLE_BINS as _N_BINS
+from synth_ultra.config import CANDLE_MIN_RETURNS as _MIN_RETURNS
+from synth_ultra.config import CANDLE_Q as _CANDLE_Q
+from synth_ultra.config import CANDLE_WIN_S as _WIN_30_S
+from synth_ultra.config import EPS as _EPS
+from synth_ultra.config import EVENT_CENTER as _EVENT_CENTER
+from synth_ultra.config import EVENT_TENT_KNOTS as _EVENT_TENT_KNOTS
+from synth_ultra.config import EVENT_TRADE_ANCHOR as _EVENT_TRADE_ANCHOR
+from synth_ultra.config import FALLBACK_SIGMA_PX as _FALLBACK_SIGMA_PX
+from synth_ultra.config import FALLBACK_SIGMA_REL as _FALLBACK_SIGMA_REL
+from synth_ultra.config import FL as _FL
+from synth_ultra.config import FLEX_FADE_HI as _FLEX_FADE_HI
+from synth_ultra.config import FLEX_FADE_LO as _FLEX_FADE_LO
+from synth_ultra.config import FLEX_N as _FLEX_N
+from synth_ultra.config import FLOW_CLIP as _FLOW_CLIP
+from synth_ultra.config import FLOW_MS as _FLOW_MS
+from synth_ultra.config import FLOW_SD as _FLOW_SD
+from synth_ultra.config import FM1_CLIP as _FM1_CLIP
+from synth_ultra.config import FM1_K as _FM1_K
+from synth_ultra.config import FM1_LIVE_N as _FM1_LIVE_N
+from synth_ultra.config import FM1_SD as _FM1_SD
+from synth_ultra.config import FM1_SD_HI as _FM1_SD_HI
+from synth_ultra.config import FM1_SD_LO as _FM1_SD_LO
+from synth_ultra.config import FR as _FR
+from synth_ultra.config import FV as _FV
+from synth_ultra.config import HIST_JUMP as _HIST_JUMP
+from synth_ultra.config import HIST_JUMP_Q as _HIST_JUMP_Q
+from synth_ultra.config import HORIZON_SECONDS, NUM_PERCENTILES, REFERENCE_ASSET, asset_param
+from synth_ultra.config import HOUR_EWMA_LAM as _HOUR_EWMA_LAM
+from synth_ultra.config import IMB_EVENT as _IMB_EVENT
+from synth_ultra.config import KA as _KA
+from synth_ultra.config import KB as _KB
+from synth_ultra.config import LIQ_HOUR_WIDEN as _LIQ_HOUR_WIDEN
+from synth_ultra.config import LIQ_K as _LIQ_K
+from synth_ultra.config import LIVE_HI as _LIVE_HI
+from synth_ultra.config import LIVE_LO as _LIVE_LO
+from synth_ultra.config import LIVE_MIN_WIDTH as _LIVE_MIN_WIDTH
+from synth_ultra.config import LIVE_N as _LIVE_N
+from synth_ultra.config import LOUD_BOOK as _LOUD_BOOK
+from synth_ultra.config import LOUD_IMB as _LOUD_IMB
+from synth_ultra.config import MAX_SIGMA_PX as _MAX_SIGMA_PX
+from synth_ultra.config import MIN_PRICE as _MIN_PRICE
+from synth_ultra.config import MIN_SIGMA_PX as _MIN_SIGMA_PX
+from synth_ultra.config import MIX_Z as _MIX_Z
+from synth_ultra.config import MU_ALPHA_CAP as _MU_ALPHA_CAP
+from synth_ultra.config import MU_CLIP_SIGMAS as _MU_CLIP
+from synth_ultra.config import MU_EXCESS as _MU_EXCESS
+from synth_ultra.config import MU_FLOOR as _MU_FLOOR
+from synth_ultra.config import MU_PULL as _MU_PULL
+from synth_ultra.config import OFI_MS as _OFI_MS
+from synth_ultra.config import QTY_LOG_DIV as _QTY_LOG_DIV
+from synth_ultra.config import REG_B as _REG_B
+from synth_ultra.config import REG_N as _REG_N
+from synth_ultra.config import RV60_N as _RV60_N
+from synth_ultra.config import SEAS_CLIP as _SEAS_CLIP
+from synth_ultra.config import SEAS_QUIET_CAP as _SEAS_QUIET_CAP
+from synth_ultra.config import SEAS_QUIET_PIVOT as _SEAS_QUIET_PIVOT
+from synth_ultra.config import SEAS_QUIET_REL as _SEAS_QUIET_REL
+from synth_ultra.config import SEAS_QUIET_SLOPE as _SEAS_QUIET_SLOPE
+from synth_ultra.config import SH as _SH
+from synth_ultra.config import SM as _SM
+from synth_ultra.config import STALE_MS_CUT as _STALE_MS_CUT
+from synth_ultra.config import TAU as _TAU
+from synth_ultra.config import VOL_LOG_BIAS as _VOL_LOG_BIAS
+from synth_ultra.config import VOL_LOG_FLOOR as _VOL_LOG_FLOOR
+from synth_ultra.config import VOL_W as _VOL_W
+from synth_ultra.config import WIDE_FLOOR as _WIDE_FLOOR
+from synth_ultra.config import WIDE_POW as _WIDE_POW
+from synth_ultra.constants import asset_spec, price_scale
 from synth_ultra.features import extract, reference_price
-from synth_ultra.layer import apply as apply_layer
 from synth_ultra.season_table import SEAS_ABS as _SEAS_ABS
 from synth_ultra.season_table import SEAS_REL as _SEAS_REL
 from synth_ultra.stillness import apply as apply_stillness
 from synth_ultra.stillness import still_features, taker_flow
 
-_EPS = 1e-12
-_MIN_PRICE = 1e-8
-_MIN_SIGMA_PX = 0.5
-_MAX_SIGMA_PX = 800.0
 _SQRT_H = math.sqrt(float(HORIZON_SECONDS))
 
-# CRPS-tuned conditional fit. The vectors stay the book/trade signal; _flex_linear
-# rescales their outputs from the last ten minutes of 10-second moves.
-_B_MU = np.array(
-    [
-        0.16219725476591365,
-        3.0392548397260206e-05,
-        1.2921967376416503e-05,
-        0.08772678796847251,
-        -0.057379556931711054,
-        -0.042592960514635785,
-        0.14437278080879343,
-        -5.040059876530939e-06,
-        -2.9598223746399192e-05,
-        8.80503231208016e-07,
-        6.543536873659752e-06,
-        3.819089008691624e-05,
-        -3.851394849050198e-05,
-        0.025639229462532766,
-        0.0,
-        7.80781830077767e-05,
-        0.2225417214564695,
-        -0.09424387369323395,
-        0.06611178032601009,
-        0.0,
-        1.3194603589745686e-05,
-        9.25776900504624e-06,
-        6.419523696500204e-06,
-        9.704432289751613e-06,
-        -7.61375359503243e-05,
-        8.219239603035196e-09,
-    ],
-    dtype=np.float64,
-)
-_B_ABS = np.array(
-    [
-        0.31128035091375017,
-        -0.04612335008069495,
-        -0.27015375057439384,
-        0.05338090769963195,
-        -0.10630344326911181,
-        0.04195075214608767,
-        0.48300301336701507,
-        0.14988622199220886,
-        0.05522149798895418,
-        0.28790522175963235,
-        -0.2171458492361658,
-        7.440005212080741e-06,
-        1.5006480516698034e-05,
-        5.258077361233235e-06,
-        -3.602539619772853,
-        -2.7531539341820717e-05,
-        0.00029563500111100656,
-        7.860095041094238e-05,
-        0.018052856090945528,
-        -0.5633117688000335,
-        -0.09328221925825791,
-        0.11197666410197983,
-        -0.19790213408961582,
-        0.3465817220321161,
-        -5.886429731585097e-08,
-        -1.194041355427959e-06,
-        1.1416268283201004e-06,
-        1.3031647192685995e-06,
-        -5.381035088350931e-07,
-        -0.0004201840209259798,
-        -1.4343343808409522e-05,
-    ],
-    dtype=np.float64,
-)
-_KA = 0.75
-_KB = 0.20
-_FL = 5e-5
-_SH = 1.20
-_FR = 0.15
-_FV = 0.05
-_SM = 1.04
-# Residual width map. The coefficients above were fit on one volatility mix, so
-# after a quieter stretch the ladder stays wide of the latest 10s moves.
-# fac = clip(A + B * s_recent / sigma, A, 1): move partway toward that
-# realized scale, never wider than the feature model, never below 80% of it.
-_REG_A = 0.80
-_REG_B = 0.30
-_REG_N = 180
-
-# Standardized quantiles of (1-w)*Laplace(0,1) + w*Laplace(0,r), w=0.15, r=3.
-# Precomputed so inference stays numpy-only (no scipy in the miner image).
-_MIX_Z = np.array(
-    [
-        -8.195296766019496,
-        -5.290455382749503,
-        -4.189473492373635,
-        -3.558928761226856,
-        -3.130018036741951,
-        -2.809478451891556,
-        -2.5554904666449834,
-        -2.3461068991409015,
-        -2.1685150645304785,
-        -2.014637822514757,
-        -1.879079631466685,
-        -1.7580695625741907,
-        -1.6488748569423617,
-        -1.5494554430067913,
-        -1.4582502010738922,
-        -1.3740392432906956,
-        -1.2958520713528672,
-        -1.2229045008325568,
-        -1.1545542250063079,
-        -1.0902688057552605,
-        -1.0296021595823457,
-        -0.9721769807684978,
-        -0.9176713964804792,
-        -0.865808692117394,
-        -0.8163492998117764,
-        -0.7690844793903884,
-        -0.7238312817274705,
-        -0.6804284955014599,
-        -0.6387333564233322,
-        -0.5986188536579183,
-        -0.559971508386832,
-        -0.5226895288992309,
-        -0.48668126838854353,
-        -0.4518639279418573,
-        -0.4181624595326374,
-        -0.3855086332303556,
-        -0.3538402400763217,
-        -0.3231004076881543,
-        -0.29323701004778674,
-        -0.26420215637718525,
-        -0.2359517467597128,
-        -0.2084450843380587,
-        -0.1816445356867318,
-        -0.15551523237167816,
-        -0.1300248078599066,
-        -0.10514316488530429,
-        -0.0808422691479815,
-        -0.05709596585577331,
-        -0.03387981614877673,
-        -0.01117095088164434,
-        0.01117095088164428,
-        0.03387981614877675,
-        0.05709596585577319,
-        0.08084226914798152,
-        0.10514316488530434,
-        0.13002480785990664,
-        0.1555152323716778,
-        0.18164453568673153,
-        0.20844508433805856,
-        0.23595174675971262,
-        0.26420215637718536,
-        0.29323701004778674,
-        0.323100407688154,
-        0.3538402400763216,
-        0.38550863323035545,
-        0.41816245953263753,
-        0.45186392794185726,
-        0.48668126838854336,
-        0.5226895288992306,
-        0.5599715083868319,
-        0.5986188536579181,
-        0.6387333564233322,
-        0.6804284955014599,
-        0.7238312817274708,
-        0.7690844793903882,
-        0.8163492998117761,
-        0.8658086921173938,
-        0.9176713964804795,
-        0.9721769807684977,
-        1.029602159582346,
-        1.0902688057552605,
-        1.1545542250063072,
-        1.2229045008325565,
-        1.2958520713528667,
-        1.374039243290695,
-        1.458250201073892,
-        1.5494554430067913,
-        1.6488748569423621,
-        1.758069562574191,
-        1.8790796314666847,
-        2.0146378225147576,
-        2.1685150645304794,
-        2.346106899140902,
-        2.5554904666449842,
-        2.8094784518915548,
-        3.130018036741951,
-        3.558928761226851,
-        4.189473492373635,
-        5.290455382749499,
-        8.195296766019453,
-    ],
-    dtype=np.float64,
-)
 # Mean absolute deviation of the mixture quantile grid. A price scale of `s`
 # then has the same mean absolute deviation as `s * _MIX_Z`.
 _Z_ABS = float(np.mean(np.abs(_MIX_Z)))
@@ -274,19 +162,13 @@ def _spot_closes(payload: dict) -> np.ndarray:
     return _venue_closes((payload.get("venues") or {}).get("spot"))
 
 
-# Log-blend of the fitted mixture scale with short-horizon 10s volatility.
-# Weights minimize pinball CRPS on the saved pairs. Fast realized vol can
-# both widen and tighten the 100-quantile ladder; the hour-average floor cannot.
-_VOL_W = (0.7199761, 0.18929481, 0.06551382, 0.02521527)
-_VOL_LOG_BIAS = 0.04421702415367945
-
 # Weight vectors depend only on the series length, which is the same few
 # thousand points on nearly every call.
 _EWMA_W: dict[tuple[int, float], np.ndarray] = {}
 _W_CACHE: dict[int, np.ndarray] = {}
 
 
-def _ewma_abs(abs_r: np.ndarray, lam: float = 0.98) -> float:
+def _ewma_abs(abs_r: np.ndarray, lam: float = _HOUR_EWMA_LAM) -> float:
     n = int(abs_r.size)
     if n == 0:
         return 0.0
@@ -329,19 +211,10 @@ def _mad(x: np.ndarray) -> float:
     return float(d.sum()) / d.size
 
 
-# Overlapping 10-second close-to-close returns from 1-second candles.
-# 30 minutes is 1,800 closes and 1,790 returns.
-_WIN_30_S = 1800
 _WIN_RET = _WIN_30_S - HORIZON_SECONDS
-_MIN_RETURNS = 40
-_N_BINS = 50
 _BIN_W = 1.0 / _N_BINS
 _BIN_EDGES = np.array([k * _BIN_W for k in range(_N_BINS)] + [1.0], dtype=np.float64)
 _BIN_SPAN = np.diff(_BIN_EDGES)
-# Floor under a mean absolute 10-second log return, and the fast window.
-_ACT_EPS = 1e-6
-_ACT_FAST = 60
-_FLEX_N = 600
 
 
 class _Hour:
@@ -388,17 +261,17 @@ class _Hour:
             return 0.0
         return px * mean_abs / _Z_ABS
 
-    def vol_aware(self, fitted: float, px: float, log_floor: float = 0.3) -> float:
+    def vol_aware(self, fitted: float, px: float, log_floor: float = _VOL_LOG_FLOOR) -> float:
         """Log-blend the fitted scale with EWMA 10s moves, 60s vol and the 10s range."""
         if self.a10 is None or not math.isfinite(fitted) or fitted <= 0.0:
             return fitted
         fast = px * _ewma_abs(self.a10) / _Z_ABS
-        if self.n >= 61:
-            tail = self.lc[-61:]
+        if self.n > _RV60_N:
+            tail = self.lc[-(_RV60_N + 1) :]
             rets = tail[1:] - tail[:-1]
             dev = rets - float(rets.sum()) / rets.size
             std = math.sqrt(float((dev * dev).sum()) / rets.size)
-            rv60 = px * (std * math.sqrt(10.0)) / _Z_ABS
+            rv60 = px * (std * _SQRT_H) / _Z_ABS
         else:
             rv60 = fast
         sl = self.c[-10:]
@@ -426,7 +299,7 @@ class _Hour:
         d = self.d10
         m = int(d.size)
         k = m // 2
-        pos = 0.99 * (m - 1)
+        pos = _HIST_JUMP_Q * (m - 1)
         j = int(pos)
         frac = pos - j
         j1 = min(j + 1, m - 1)
@@ -456,7 +329,7 @@ class _Hour:
         order = np.argsort(aw)
         sv = aw[order]
         bins = _bin_means(sv, _recency_weights(m)[order])
-        pos = 0.9 * (m - 1)
+        pos = _CANDLE_Q * (m - 1)
         i0 = int(pos)
         frac = pos - i0
         a = float(sv[i0])
@@ -478,12 +351,14 @@ def _vol_aware_scale(fitted: float, close: np.ndarray, px: float) -> float:
     return _Hour(close).vol_aware(float(fitted), float(px))
 
 
-def _regime_scale(sigma_px: float, close: np.ndarray, hour: _Hour | None = None) -> float:
+def _regime_scale(
+    sigma_px: float, close: np.ndarray, hour: _Hour | None = None, asset: str = REFERENCE_ASSET
+) -> float:
     """Shrink a scale that is wide of the latest few minutes of 10s moves.
 
     ``s_recent`` is the mixture scale whose mean absolute deviation matches
     the last ``_REG_N`` overlapping 10-second dollar moves. The map
-    ``clip(_REG_A + _REG_B * s_recent / sigma, _REG_A, 1)`` was chosen so
+    ``clip(REG_A + REG_B * s_recent / sigma, REG_A, 1)`` was chosen so
     every 4-hour window of saved prompts has a lower pinball CRPS. Short
     candle history leaves the feature-model scale unchanged.
     """
@@ -497,19 +372,10 @@ def _regime_scale(sigma_px: float, close: np.ndarray, hour: _Hour | None = None)
     ratio = (mad / _Z_ABS) / sigma
     if not math.isfinite(ratio):
         return sigma
-    return sigma * _clip(_REG_A + _REG_B * ratio, _REG_A, 1.0)
+    reg_a = asset_param(asset, "REG_A")
+    return sigma * _clip(reg_a + _REG_B * ratio, reg_a, 1.0)
 
 
-# Location gain and a further width step, fit so every 6-hour window improves.
-# A shift larger than 0.6 widths is pulled toward spot. The pull strengthens
-# when the ladder is wide of the last _FLEX_N absolute 10-second moves, and
-# the shift is never taken below 75% of the feature-model value. Width moves
-# at most 4% toward that same realized scale and is never increased.
-_MU_EXCESS = 0.60
-_MU_PULL = 0.40
-_MU_FLOOR = 0.45
-_WIDE_POW = 0.05
-_WIDE_FLOOR = 0.96
 
 
 def _flex_linear(
@@ -525,41 +391,13 @@ def _flex_linear(
     ratio = (mad / _Z_ABS) / sigma
     if not math.isfinite(ratio) or ratio <= 0.0:
         return mu, sigma
-    fade = 1.0 / _clip(ratio, 0.3, 1.5)
+    fade = 1.0 / _clip(ratio, _FLEX_FADE_LO, _FLEX_FADE_HI)
     excess = max(abs(mu) / sigma - _MU_EXCESS, 0.0)
     gain = _clip(1.0 - _MU_PULL * excess * fade, _MU_FLOOR, 1.0)
     width = _clip(ratio**_WIDE_POW, _WIDE_FLOOR, 1.0)
     return mu * gain, sigma * width
 
 
-# Centered-quantile probabilities, q_i = (2i-1)/200.
-_TAU = (2.0 * np.arange(1, NUM_PERCENTILES + 1) - 1.0) / 200.0
-# Mix in the book sample only while its mean absolute move is below this
-# fraction of the feature-ladder width. The slope and cap are the choice
-# that lowers pinball CRPS on every 12-hour window.
-_BOOK_PIVOT = 0.65
-_BOOK_SLOPE = 0.35
-_BOOK_CAP = 0.18
-# Fold the payload's own 10s book-move quantiles into the ladder when the
-# hour is not a single-outlier regime. p99/median above this means the typical
-# move is ~0 or one crash dominates, and the book sample is a poor center.
-# 0.27 is the blend that lowered both the early and late saved prompts.
-_HIST_JUMP = 12.0
-_HIST_W = 0.27
-# On a flat hour the fixed ladder is a little wide through the middle.
-# Pull those central quantiles in; leave the outer crash points where they are.
-_CALM_CORE = 0.98
-# Last-second spot order-flow imbalance, divided by the quote turnover in
-# that second. The linear book features are a stock of size; this is the
-# flow. The shift is this fraction of the forecast width.
-_OFI_K = 0.35
-_OFI_MS = 1000
-
-
-# A busy minute can carry tens of thousands of book ticks. The 100-quantile
-# grid only needs a couple of thousand 10s pairs; extra ticks repeat the same
-# move. Cap the paired sample so a 2-core host stays inside the latency budget.
-_BOOK_PAIRS = 1600
 
 
 def _f64_col(x: object) -> np.ndarray:
@@ -594,14 +432,14 @@ def _book_offsets(book: dict | None) -> np.ndarray | None:
     if ts_raw is None:
         return None
     ts = _i64_col(ts_raw)
-    if ts.size < 80:
+    if ts.size < _BOOK_MIN_TICKS:
         return None
     bp = _f64_col(book.get("bid_price"))
     bq = _f64_col(book.get("bid_qty"))
     ap = _f64_col(book.get("ask_price"))
     aq = _f64_col(book.get("ask_qty"))
     n = int(min(ts.size, bp.size, bq.size, ap.size, aq.size))
-    if n < 80:
+    if n < _BOOK_MIN_TICKS:
         return None
     ts = ts[-n:]
     bp = bp[-n:]
@@ -610,11 +448,11 @@ def _book_offsets(book: dict | None) -> np.ndarray | None:
     aq = aq[-n:]
     step = 1 if n <= _BOOK_PAIRS else (n + _BOOK_PAIRS - 1) // _BOOK_PAIRS
     ts_i = ts[::step]
-    j = np.searchsorted(ts, ts_i + 10_000, side="right") - 1
+    j = np.searchsorted(ts, ts_i + HORIZON_SECONDS * 1000, side="right") - 1
     ii = np.arange(0, n, step, dtype=np.int64)
-    ok = (j > ii) & (ts[j] >= ts_i + 9_000)
+    ok = (j > ii) & (ts[j] >= ts_i + _BOOK_MIN_GAP_MS)
     k = int(np.count_nonzero(ok))
-    if k < 40:
+    if k < _BOOK_MIN_PAIRS:
         return None
     both = _micro_at(bp, bq, ap, aq, np.concatenate((ii[ok], j[ok])))
     ordered = np.sort(both[k:] - both[:k])
@@ -723,7 +561,7 @@ def _blend_scale(fitted: float, realized: float) -> float:
     """
     if not math.isfinite(realized) or realized <= fitted or fitted <= 0.0:
         return fitted
-    return fitted * (realized / fitted) ** 0.8
+    return fitted * (realized / fitted) ** _BLEND_REALIZED_POW
 
 
 def _hist_jump_ratio(close: np.ndarray) -> float:
@@ -766,7 +604,7 @@ def _mu_vec(f: dict[str, float], vol10: float) -> np.ndarray:
             flow,
             imb * vol10,
             flow * vol10,
-            math.tanh(f["c1"] * 3000.0),
+            math.tanh(f["c1"] * _C1_TANH_SCALE),
             f["basis"] * vol10,
         ],
         dtype=np.float64,
@@ -776,7 +614,7 @@ def _mu_vec(f: dict[str, float], vol10: float) -> np.ndarray:
 def _abs_vec(f: dict[str, float], vol10: float, vol_fast10: float) -> np.ndarray:
     rng = max(f["s_rng"], f["f_rng"])
     rv = max(f["s_rv"], f["f_rv"])
-    log_fqty = math.log1p(max(f["f_qty2"], 0.0)) / 10.0
+    log_fqty = math.log1p(max(f["f_qty2"], 0.0)) / _QTY_LOG_DIV
     return np.array(
         [
             vol10,
@@ -794,7 +632,7 @@ def _abs_vec(f: dict[str, float], vol10: float, vol_fast10: float) -> np.ndarray
             abs(f["obi"]),
             abs(f["flow_fast"]),
             f["spread_rel"],
-            math.log1p(max(f["s_qty2"], 0.0)) / 10.0,
+            math.log1p(max(f["s_qty2"], 0.0)) / _QTY_LOG_DIV,
             log_fqty,
             1.0,
             f["c1"],
@@ -809,23 +647,12 @@ def _abs_vec(f: dict[str, float], vol10: float, vol_fast10: float) -> np.ndarray
             max(rng - vol10, 0.0),
             log_fqty * rng,
             f["stale_ms"] / 1000.0,
-            1.0 if f["stale_ms"] > 250.0 else 0.0,
+            1.0 if f["stale_ms"] > _STALE_MS_CUT else 0.0,
         ],
         dtype=np.float64,
     )
 
 
-# Seasonal characters are generated by scripts/update_season.py into
-# season_table.py. The 1-minute price file is not read at inference.
-_SEAS_W = 0.35
-_SEAS_CLIP = 0.35
-_SEAS_LEVEL = 1.0
-# Weekend slots quieter than this fraction of the same weekday hour trust
-# the payload's own 10s book quantiles more.
-_SEAS_QUIET_REL = 0.70
-_SEAS_QUIET_CAP = 0.85
-_SEAS_QUIET_PIVOT = 1.00
-_SEAS_QUIET_SLOPE = 1.00
 
 
 def _slot_index(now_ms: int) -> int:
@@ -837,7 +664,7 @@ def _slot_index(now_ms: int) -> int:
     return (dow * 24 + sod // 3600) * 6 + (sod % 3600) // 600
 
 
-def _season_scale(sigma_px: float, px: float, now_ms: int) -> float:
+def _season_scale(sigma_px: float, px: float, now_ms: int, asset: str = REFERENCE_ASSET) -> float:
     """Pull width toward this slot's typical 10-second move.
 
     The ladder already follows the payload's books and candles. The blend
@@ -855,10 +682,10 @@ def _season_scale(sigma_px: float, px: float, now_ms: int) -> float:
         or int(now_ms) < 0
     ):
         return sigma
-    seas = price * float(_SEAS_ABS[_slot_index(now_ms)]) / _Z_ABS * _SEAS_LEVEL
+    seas = price * float(_SEAS_ABS[_slot_index(now_ms)]) / _Z_ABS
     if not math.isfinite(seas) or seas <= 0.0:
         return sigma
-    adj = _clip(_SEAS_W * (math.log(seas) - math.log(sigma)), -_SEAS_CLIP, _SEAS_CLIP)
+    adj = _clip(asset_param(asset, "SEAS_W") * (math.log(seas) - math.log(sigma)), -_SEAS_CLIP, _SEAS_CLIP)
     return sigma * math.exp(adj)
 
 
@@ -885,8 +712,6 @@ def _season_book(now_ms: int) -> tuple[float, float, float]:
 last_mu_px = float("nan")
 last_anchor_px = float("nan")
 
-# |μ| / mean(|log return|) above this would push one wing through the anchor.
-_MU_ALPHA_CAP = 1.0
 
 
 def _bin_means(sorted_values: np.ndarray, sorted_weights: np.ndarray) -> np.ndarray:
@@ -948,54 +773,24 @@ def _skewed_candle_prices(px: float, bins: np.ndarray, mu_px: float) -> np.ndarr
     return out
 
 
-# Clock prompts mix the candle distribution with the mixture. The candle
-# weight is a logistic of the half-hour 90th percentile 10-second move:
-# about 0.70 when that move is $0, one half at $7.5, and gone once the hour
-# is much louder. A hotter last minute, relative to that half hour, lowers
-# the candle share. Pivot and temperature were re-chosen with the stillness
-# point mass in place; both halves of the saved prompts agreed.
-_BLEND_PIVOT = 7.5
-_BLEND_TEMP = 9.0
-_BLEND_BETA = 0.12
-# The fitted drift runs a little hot. Keep most of it, and add part of the
-# last one-second move, which the drift underweights.
-_MU_KEEP = 0.85
-_C1_KEEP = 0.60
-# Buy-liquidation and re-anchored depth-band shifts, as a fraction of width.
-_LIQ_K = 0.04
-_BAND_K = 0.03
-# Top-of-book imbalance continues over the next 10 seconds. The linear fit
-# barely used it. A full imbalance shifts the center by this fraction of the
-# width; trade-triggered prompts get a slightly larger fraction.
-_IMB_K = 0.35
-_IMB_EVENT = 0.50
-# A one-sided book should keep that shift. The hour's centered book quantiles
-# otherwise pull it back toward spot. Applied when |imbalance| exceeds the cut.
-_LOUD_IMB = 0.60
-_LOUD_BOOK = 0.60
-# Non-clock forecasts are tight between the 25% and 75% prices: that central
-# interval covered 46.8% on both the early and later saved prompts. This
-# fraction of the inner quartile gap is added outside the median. It fades to
-# zero at the median and at the 10% and 90% prices. 0.08 is where both slices
-# bottomed.
-_EVENT_CENTER = 0.08
 _EVENT_TENT = np.zeros(_TAU.shape, dtype=np.float64)
-_left_band = (_TAU > 0.10) & (_TAU < 0.50)
+_T_LO, _T_Q1, _T_MID, _T_Q3, _T_HI = _EVENT_TENT_KNOTS
+_left_band = (_TAU > _T_LO) & (_TAU < _T_MID)
 _EVENT_TENT[_left_band] = np.where(
-    _TAU[_left_band] <= 0.25,
-    (_TAU[_left_band] - 0.10) / 0.15,
-    (0.50 - _TAU[_left_band]) / 0.25,
+    _TAU[_left_band] <= _T_Q1,
+    (_TAU[_left_band] - _T_LO) / (_T_Q1 - _T_LO),
+    (_T_MID - _TAU[_left_band]) / (_T_MID - _T_Q1),
 )
-_right_band = (_TAU > 0.50) & (_TAU < 0.90)
+_right_band = (_TAU > _T_MID) & (_TAU < _T_HI)
 _EVENT_TENT[_right_band] = np.where(
-    _TAU[_right_band] <= 0.75,
-    (_TAU[_right_band] - 0.50) / 0.25,
-    (0.90 - _TAU[_right_band]) / 0.15,
+    _TAU[_right_band] <= _T_Q3,
+    (_TAU[_right_band] - _T_MID) / (_T_Q3 - _T_MID),
+    (_T_HI - _TAU[_right_band]) / (_T_HI - _T_Q3),
 )
 _EVENT_TENT[:11] = 0.0
 _EVENT_TENT[49:51] = 0.0
 _EVENT_TENT[89:] = 0.0
-_EVENT_LEFT = _TAU < 0.50
+_EVENT_LEFT = _TAU < _T_MID
 
 
 def _widen_event_center(pct: np.ndarray) -> np.ndarray:
@@ -1125,6 +920,7 @@ def _combine(
     trigger: str,
     activity: float,
     scale: float = 1.0,
+    asset: str = REFERENCE_ASSET,
 ) -> np.ndarray:
     """Mix the candle and mixture distributions on clock prompts.
 
@@ -1133,7 +929,7 @@ def _combine(
     candle distribution in proportion to how quiet the recent hour has been,
     and how quiet the last minute is relative to that hour.
     """
-    shift = (_MU_KEEP - 1.0) * float(mu_px) + _C1_KEEP * float(c1_px)
+    shift = (asset_param(asset, "MU_KEEP") - 1.0) * float(mu_px) + asset_param(asset, "C1_KEEP") * float(c1_px)
     mixture = ladder + shift
     np.maximum(mixture, _MIN_PRICE, out=mixture)
     np.maximum.accumulate(mixture, out=mixture)
@@ -1175,32 +971,32 @@ def _forecast_from_parts(
     sigma_px = max(sigma_px, (_FR * rng + _FV * rv) * px)
     sigma_px = _clip(sigma_px * _SM, lo, hi)
     sigma_px = _blend_scale(sigma_px, h.realized_mix(px))
-    sigma_px = h.vol_aware(sigma_px, px, log_floor=0.3 * scale)
+    sigma_px = h.vol_aware(sigma_px, px, log_floor=_VOL_LOG_FLOOR * scale)
     sigma_px = _clip(sigma_px, lo, hi)
-    mu_px = _clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px)
+    mu_px = _clip(mu_px, -_MU_CLIP * sigma_px, _MU_CLIP * sigma_px)
     # input.md: a buy liquidation pushes price up; depth bands must be
     # re-anchored to the live mid before they can shift the book.
     mu_px += (_LIQ_K * f["liq_dir"] + _BAND_K * f["band_imb"]) * sigma_px
-    sigma_px *= 1.0 + 0.20 * max(f["liq_hour"], 0.0)
+    sigma_px *= 1.0 + _LIQ_HOUR_WIDEN * max(f["liq_hour"], 0.0)
     sigma_px = _clip(sigma_px, lo, hi)
-    sigma_px = _regime_scale(sigma_px, closes, h)
+    sigma_px = _regime_scale(sigma_px, closes, h, asset)
     sigma_px = _clip(sigma_px, lo, hi)
-    mu_px = _clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px)
+    mu_px = _clip(mu_px, -_MU_CLIP * sigma_px, _MU_CLIP * sigma_px)
     mu_px, sigma_px = _flex_linear(mu_px, sigma_px, closes, h)
     sigma_px = _clip(sigma_px, lo, hi)
-    mu_px = _clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px)
-    sigma_px = _season_scale(sigma_px, px, now_ms)
+    mu_px = _clip(mu_px, -_MU_CLIP * sigma_px, _MU_CLIP * sigma_px)
+    sigma_px = _season_scale(sigma_px, px, now_ms, asset)
     sigma_px = _clip(sigma_px, lo, hi)
-    mu_px += _OFI_K * float(ofi) * sigma_px
+    mu_px += asset_param(asset, "OFI_K") * float(ofi) * sigma_px
     # Spot and futures top-of-book imbalance. On the prompts where the next
     # move is large, this sign is right about four times in five, and the
     # linear book coefficients were too small to use it.
     imb = 0.5 * (float(f["s_imb"]) + float(f["f_imb"]))
-    imb_k = _IMB_EVENT if trigger != "time" else _IMB_K
+    imb_k = _IMB_EVENT if trigger != "time" else asset_param(asset, "IMB_K")
     mu_px += imb_k * imb * sigma_px
-    mu_px = _clip(mu_px, -5.0 * sigma_px, 5.0 * sigma_px)
+    mu_px = _clip(mu_px, -_MU_CLIP * sigma_px, _MU_CLIP * sigma_px)
     book_cap, book_pivot, book_slope = _season_book(now_ms)
-    hist_w = _HIST_W
+    hist_w = asset_param(asset, "HIST_W")
     if abs(imb) >= _LOUD_IMB:
         book_cap *= _LOUD_BOOK
         hist_w *= _LOUD_BOOK
@@ -1224,7 +1020,7 @@ def _forecast_from_parts(
     bins, p90, activity = h.candle_parts(px)
     candle = None if bins is None else _skewed_candle_prices(px, bins, mu_px)
     c1_px = float(f["c1"]) * px
-    mixed = _combine(ladder, candle, mu_px, c1_px, p90, trigger, activity, scale)
+    mixed = _combine(ladder, candle, mu_px, c1_px, p90, trigger, activity, scale, asset)
     if trigger != "time":
         mixed = _widen_event_center(mixed)
     last_mu_px = float(mu_px)
@@ -1232,21 +1028,6 @@ def _forecast_from_parts(
     return mixed
 
 
-# Futures taker flow in the last second leads spot after a trade print. One
-# standard deviation of that flow (5.6 BTC on the saved trade-triggered
-# prompts) moves the forecast by this fraction of its width; the flow is
-# clipped at four deviations. Both halves of the saved prompts improved.
-_FLOW_K = 0.10
-_FLOW_SD = 5.644958570072203
-_FLOW_CLIP = 4.0
-_FLOW_MS = 1000
-# The linear path and the last-second candle already spend the 1s futures
-# micro return. On trade prints that overshoots: one standardized 1s futures
-# move pulls the ladder back by this fraction of its width. Fit on the first
-# 60% of saved event prompts; the later 40% improved by more.
-_FM1_K = -0.08
-_FM1_SD = 7.34486046119216e-05
-_FM1_CLIP = 4.0
 
 
 def _event_shift(
@@ -1256,13 +1037,14 @@ def _event_shift(
     now_ms: int,
     flow_sd: float = _FLOW_SD,
     fm1_sd: float = _FM1_SD,
+    asset: str = REFERENCE_ASSET,
 ) -> np.ndarray:
     """Trade-print location: futures taker flow minus the spent 1s futures move."""
     flow = taker_flow((fut or {}).get("trades"), now_ms, _FLOW_MS)
     zf = _clip(flow / flow_sd, -_FLOW_CLIP, _FLOW_CLIP)
     denom = fm1_sd if math.isfinite(fm1_sd) and fm1_sd > 0.0 else _FM1_SD
     zm = _clip(float(f["f_m1"]) / denom, -_FM1_CLIP, _FM1_CLIP)
-    delta = _FLOW_K * zf + _FM1_K * zm
+    delta = asset_param(asset, "FLOW_K") * zf + _FM1_K * zm
     if not (delta != 0.0) or not math.isfinite(delta):
         return q
     med = 0.5 * (float(q[49]) + float(q[50]))
@@ -1286,8 +1068,8 @@ def _fallback(payload: dict) -> np.ndarray:
         px = _MIN_PRICE
     last_mu_px = 0.0
     last_anchor_px = float(px)
-    asset = str(((payload or {}).get("prompt") or {}).get("asset") or "BTC")
-    return _ladder(px, 0.0, max(8.0 * price_scale(asset, px), 1e-4 * px))
+    asset = str(((payload or {}).get("prompt") or {}).get("asset") or REFERENCE_ASSET)
+    return _ladder(px, 0.0, max(_FALLBACK_SIGMA_PX * price_scale(asset, px), _FALLBACK_SIGMA_REL * px))
 
 
 def predict_percentiles(payload: dict) -> np.ndarray:
@@ -1319,8 +1101,7 @@ def predict_percentiles(payload: dict) -> np.ndarray:
         hour = _Hour(closes)
         now_ms = int(prompt.get("current_time_ms") or 0)
         trigger = str((prompt.get("trigger") or {}).get("kind") or "time")
-        asset = str(prompt.get("asset") or "BTC")
-        _use_knobs(asset)
+        asset = str(prompt.get("asset") or REFERENCE_ASSET)
         out = _forecast_from_parts(
             f,
             closes,
@@ -1346,15 +1127,6 @@ def _valid(out: np.ndarray) -> bool:
     return out.shape == (NUM_PERCENTILES,) and out[0] > 0.0 and math.isfinite(float(out.sum()))
 
 
-# The fitted ladder is a bit wide of the last few minutes once the regime has
-# cooled, and a bit tight after it has heated up. Move 50% of the way toward
-# the width of the latest 180 overlapping 10-second moves, and never by more
-# than 10%. The stillness atom is put back on the anchor afterwards.
-_LIVE_POW = 0.50
-_LIVE_LO = 0.90
-_LIVE_HI = 1.10
-_LIVE_N = 180
-_ATOM = 0.02
 
 
 def _atom_band(asset: str, scale: float) -> float:
@@ -1364,7 +1136,7 @@ def _atom_band(asset: str, scale: float) -> float:
     scaled by price falls through the tick, so the live-width step was
     smearing the atom off the touch.
     """
-    if asset == "BTC":
+    if asset == REFERENCE_ASSET:
         return _ATOM
     tick = asset_spec(asset).tick
     return max(_ATOM * scale, tick)
@@ -1377,8 +1149,8 @@ def _live_fm1_sd(closes: np.ndarray) -> float:
     same constant treats an ordinary print as a four-sigma futures move.
     """
     c = closes.reshape(-1) if isinstance(closes, np.ndarray) else np.asarray(closes, dtype=np.float64)
-    if c.size > 181:
-        c = c[-181:]
+    if c.size > _FM1_LIVE_N + 1:
+        c = c[-(_FM1_LIVE_N + 1) :]
     keep = np.isfinite(c) & (c > 0.0)
     if not bool(keep.all()):
         c = c[keep]
@@ -1391,7 +1163,7 @@ def _live_fm1_sd(closes: np.ndarray) -> float:
     sd = float(r.std())
     if not math.isfinite(sd) or sd <= 0.0:
         return _FM1_SD
-    return _clip(sd, 0.5 * _FM1_SD, 12.0 * _FM1_SD)
+    return _clip(sd, _FM1_SD_LO * _FM1_SD, _FM1_SD_HI * _FM1_SD)
 
 
 def _live_width(
@@ -1400,6 +1172,7 @@ def _live_width(
     anchor: float,
     scale: float = 1.0,
     atom: float = _ATOM,
+    asset: str = REFERENCE_ASSET,
 ) -> np.ndarray:
     """Rescale a finished ladder toward the payload's own recent 10s moves."""
     c = closes.reshape(-1) if isinstance(closes, np.ndarray) else np.asarray(closes, dtype=np.float64)
@@ -1421,9 +1194,9 @@ def _live_width(
     ew = float(np.abs(emp - em).mean())
     med = 0.5 * (float(q[49]) + float(q[50]))
     width = float(np.abs(q - med).mean())
-    if not math.isfinite(ew) or ew <= 0.0 or width < 0.5 * scale or not math.isfinite(med):
+    if not math.isfinite(ew) or ew <= 0.0 or width < _LIVE_MIN_WIDTH * scale or not math.isfinite(med):
         return q
-    alpha = _clip((ew / width) ** _LIVE_POW, _LIVE_LO, _LIVE_HI)
+    alpha = _clip((ew / width) ** asset_param(asset, "LIVE_POW"), _LIVE_LO, _LIVE_HI)
     if abs(alpha - 1.0) < 1e-4:
         return q
     x = med + alpha * (q - med)
@@ -1437,15 +1210,11 @@ def _live_width(
     return x
 
 
-# Residual scale after the BTC ladder is expressed in each asset's own units.
-# ETH is closest to BTC's log-vol, SOL and XRP run wider than that fit.
-# SOL and XRP were re-chosen together with their asset_knobs values.
-_WIDTH_ASSET = {"ETH": 1.25, "SOL": 1.3538, "XRP": 1.568}
 
 
 def _asset_width(q: np.ndarray, anchor: float, asset: str, scale: float) -> np.ndarray:
     """Open a non-BTC ladder. The stillness prices on the touch stay put."""
-    alpha = _WIDTH_ASSET.get(asset, 1.0)
+    alpha = asset_param(asset, "WIDTH")
     if alpha == 1.0:
         return q
     med = 0.5 * (float(q[49]) + float(q[50]))
@@ -1477,7 +1246,7 @@ def _post_layers(
     anchor = max(f["price"], _MIN_PRICE)
     scale = price_scale(asset, anchor)
     if event:
-        fm1_sd = _FM1_SD if asset == "BTC" else _live_fm1_sd(closes)
+        fm1_sd = _FM1_SD if asset == REFERENCE_ASSET else _live_fm1_sd(closes)
         q = _event_shift(
             q,
             f,
@@ -1485,34 +1254,34 @@ def _post_layers(
             now_ms,
             flow_sd=_FLOW_SD / scale,
             fm1_sd=fm1_sd,
+            asset=asset,
         )
     seas = float(_SEAS_ABS[_slot_index(now_ms)]) if now_ms >= 0 else 0.0
     x = still_features(payload, closes, now_ms, seas, 0.0, asset=asset)
     q = apply_stillness(q, anchor, x, event, asset=asset)
-    q = _live_width(q, closes, anchor, scale, _atom_band(asset, scale))
+    q = _live_width(q, closes, anchor, scale, _atom_band(asset, scale), asset)
     q = _asset_width(q, anchor, asset, scale)
-    q = apply_layer(q, anchor, asset, trigger, payload, now_ms, f)
+    if event:
+        q = _trade_anchor(q, anchor, f["s_last_trade"], _atom_band(asset, scale))
     return q if _valid(q) else out
 
 
-# Each asset's knob values. The constants above are the shared fallback for
-# any knob an asset does not list. Predictions run one at a time (the
-# stillness buffers are module-level too), so the knobs are set per call.
-_KNOB_HOMES = {"model": sys.modules[__name__], "stillness": _stillness}
-_KNOB_KEYS = tuple(sorted({k for table in _ASSET_KNOBS.values() for k in table}))
-_KNOB_SLOTS = tuple((_KNOB_HOMES[k.split(".", 1)[0]], k.split(".", 1)[1]) for k in _KNOB_KEYS)
-_KNOB_DEFAULTS = tuple(getattr(home, attr) for home, attr in _KNOB_SLOTS)
-_knob_asset: str | None = None
+def _trade_anchor(q: np.ndarray, anchor: float, last_trade: float, band: float) -> np.ndarray:
+    """Move the non-still prices of a trade-triggered ladder toward the last spot print.
 
-
-def _use_knobs(asset: str) -> None:
-    global _knob_asset
-    if asset == _knob_asset:
-        return
-    table = _ASSET_KNOBS.get(asset, {})
-    for key, (home, attr), default in zip(_KNOB_KEYS, _KNOB_SLOTS, _KNOB_DEFAULTS):
-        setattr(home, attr, table.get(key, default))
-    _knob_asset = asset
+    The quote can lag the print that fired the prompt. Prices farther than
+    ``band`` from the anchor shift by ``EVENT_TRADE_ANCHOR`` of the print's gap
+    to the anchor; the stillness mass stays on the quote.
+    """
+    k = _EVENT_TRADE_ANCHOR
+    if k == 0.0 or not (last_trade > 0.0) or not math.isfinite(last_trade):
+        return q
+    shift = k * (float(last_trade) - float(anchor))
+    if shift == 0.0 or not math.isfinite(shift):
+        return q
+    x = np.where(np.abs(q - anchor) > band, q + shift, q)
+    x.sort()
+    return x
 
 
 def _warmup_payload(trigger: str) -> dict:

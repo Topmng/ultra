@@ -12,7 +12,27 @@ from typing import Any
 
 import numpy as np
 
-from synth_ultra.constants import HORIZON_SECONDS, price_scale
+from synth_ultra.config import (
+    BAND_MAX_AGE_MS,
+    BAND_REACH_BANDS,
+    BOOK_LOOKBACK_MS,
+    BOOK_RV_SAMPLES,
+    DEPTH_BAND_USD,
+    DEPTH_TOP_N,
+    FLOW_LAST_N,
+    FLOW_WINDOW_MS,
+    HORIZON_SECONDS,
+    LIQ_HOUR_UNIT,
+    LIQ_QTY_UNIT,
+    LIQ_RECENT_MS,
+    REF_MAX_RATIO,
+    VOL_EWMA_LAM,
+    VOL_EWMA_N,
+    VOL_FAST_LAM,
+    VOL_FAST_N,
+    VOL_SPOT_WEIGHT,
+)
+from synth_ultra.constants import price_scale
 
 
 def microprice(bid_p: float, bid_q: float, ask_p: float, ask_q: float) -> float:
@@ -96,7 +116,7 @@ def _side_sizes(levels: Any, n: int = 5) -> tuple[float, float] | None:
     return float(qty.sum()), float(qty[:n].sum())
 
 
-def depth_imbalances(snapshot: dict | None, n: int = 5) -> tuple[float, float]:
+def depth_imbalances(snapshot: dict | None, n: int = DEPTH_TOP_N) -> tuple[float, float]:
     """All-level and top-``n`` resting-size imbalance of one depth snapshot."""
     if not snapshot:
         return 0.0, 0.0
@@ -114,11 +134,13 @@ def depth_imbalance(snapshot: dict | None) -> float:
     return depth_imbalances(snapshot)[0]
 
 
-def top_imbalance(snapshot: dict | None, n: int = 5) -> float:
+def top_imbalance(snapshot: dict | None, n: int = DEPTH_TOP_N) -> float:
     return depth_imbalances(snapshot, n)[1]
 
 
-def trade_flows(trades: dict | None, last_n: int = 50, window_ms: int = 2000) -> tuple[float, float, float, float]:
+def trade_flows(
+    trades: dict | None, last_n: int = FLOW_LAST_N, window_ms: int = FLOW_WINDOW_MS
+) -> tuple[float, float, float, float]:
     """Signed taker imbalance: whole tape, last ``last_n`` prints, last ``window_ms``.
 
     Returns ``(full, last_n, window, window_qty)``. ``buyer_is_maker`` True
@@ -156,28 +178,28 @@ def trade_imbalance(trades: dict | None, last_n: int | None = None) -> float:
     return fast if last_n is not None else full
 
 
-def trade_flow_window(trades: dict | None, window_ms: int = 2000) -> tuple[float, float]:
+def trade_flow_window(trades: dict | None, window_ms: int = FLOW_WINDOW_MS) -> tuple[float, float]:
     """Signed flow imbalance and total qty over the last ``window_ms``."""
     _full, _fast, flow, qty = trade_flows(trades, window_ms=window_ms)
     return flow, qty
 
 
 # Cached EWMA weights for the candle lengths we actually use (avoids alloc per call).
-_EWMA_W94_120 = (1.0 - 0.94) * (0.94 ** np.arange(119, -1, -1, dtype=np.float64))
-_EWMA_W94_120 /= _EWMA_W94_120.sum()
-_EWMA_W85_90 = (1.0 - 0.85) * (0.85 ** np.arange(89, -1, -1, dtype=np.float64))
-_EWMA_W85_90 /= _EWMA_W85_90.sum()
+_EWMA_SLOW = (1.0 - VOL_EWMA_LAM) * (VOL_EWMA_LAM ** np.arange(VOL_EWMA_N - 1, -1, -1, dtype=np.float64))
+_EWMA_SLOW /= _EWMA_SLOW.sum()
+_EWMA_FAST = (1.0 - VOL_FAST_LAM) * (VOL_FAST_LAM ** np.arange(VOL_FAST_N - 1, -1, -1, dtype=np.float64))
+_EWMA_FAST /= _EWMA_FAST.sum()
 
 
-def ewma_vol(returns: np.ndarray, lam: float = 0.94) -> float:
+def ewma_vol(returns: np.ndarray, lam: float = VOL_EWMA_LAM) -> float:
     if returns.size == 0:
         return 0.0
     r2 = returns * returns
     n = r2.size
-    if lam == 0.94 and n == _EWMA_W94_120.size:
-        return math.sqrt(float(np.dot(_EWMA_W94_120, r2)))
-    if lam == 0.85 and n == _EWMA_W85_90.size:
-        return math.sqrt(float(np.dot(_EWMA_W85_90, r2)))
+    if lam == VOL_EWMA_LAM and n == _EWMA_SLOW.size:
+        return math.sqrt(float(np.dot(_EWMA_SLOW, r2)))
+    if lam == VOL_FAST_LAM and n == _EWMA_FAST.size:
+        return math.sqrt(float(np.dot(_EWMA_FAST, r2)))
     w = (1.0 - lam) * lam ** np.arange(n - 1, -1, -1, dtype=np.float64)
     w /= w.sum()
     return math.sqrt(float(np.dot(w, r2)))
@@ -197,7 +219,7 @@ def _close_tail(venue: dict | None, n: int) -> np.ndarray:
     return np.asarray(arr[-n:, 3], dtype=np.float64)
 
 
-_TAIL = max(HORIZON_SECONDS + 1, 121)
+_TAIL = max(HORIZON_SECONDS + 1, VOL_EWMA_N + 1)
 
 
 def _tail_stats(close: np.ndarray) -> tuple[float, float, float, float, float]:
@@ -206,8 +228,8 @@ def _tail_stats(close: np.ndarray) -> tuple[float, float, float, float, float]:
         return 0.0, 0.0, 0.0, 0.0, 0.0
     lc = np.log(np.maximum(close, 1e-12))
     rets = lc[1:] - lc[:-1]
-    vol = ewma_vol(rets[-120:])
-    vol_fast = ewma_vol(rets[-90:], lam=0.85)
+    vol = ewma_vol(rets[-VOL_EWMA_N:])
+    vol_fast = ewma_vol(rets[-VOL_FAST_N:], lam=VOL_FAST_LAM)
     mom = 0.0
     if close.size > HORIZON_SECONDS:
         c0 = float(close[-(HORIZON_SECONDS + 1)])
@@ -235,7 +257,7 @@ def venue_vol_and_momentum(venue: dict | None) -> tuple[float, float]:
 _NO_BOOK = {"imb": 0.0, "m1": 0.0, "m3": 0.0, "m5": 0.0, "rv": 0.0, "rng": 0.0}
 
 
-def book_ticker_stats(book_ticker: dict | None, lookback_ms: int = 12_000) -> dict[str, float]:
+def book_ticker_stats(book_ticker: dict | None, lookback_ms: int = BOOK_LOOKBACK_MS) -> dict[str, float]:
     """Microprice momentum, range, and realized vol from recent book ticker.
 
     Avoids building a full microprice series on busy 10k–60k-tick windows
@@ -316,7 +338,7 @@ def book_ticker_stats(book_ticker: dict | None, lookback_ms: int = 12_000) -> di
     return out
 
 
-_N_SAMP = 512
+_N_SAMP = BOOK_RV_SAMPLES
 _SAMP_STEPS = np.arange(_N_SAMP, dtype=np.float64)
 
 
@@ -347,8 +369,8 @@ def _as_int_scalar(v: Any) -> int | None:
 def liquidation_signals(
     liquidations: dict | None,
     now_ms: int,
-    qty_unit: float = 0.25,
-    hour_unit: float = 1.0,
+    qty_unit: float = LIQ_QTY_UNIT,
+    hour_unit: float = LIQ_HOUR_UNIT,
 ) -> tuple[float, float]:
     """Signed 10s pressure and 1h activity from futures liquidations.
 
@@ -375,7 +397,7 @@ def liquidation_signals(
         return 0.0, 0.0
     q = qty[hour]
     r = recv[hour]
-    recent = r >= now - 10_000
+    recent = r >= now - LIQ_RECENT_MS
     signed = 0.0
     if recent.any():
         qr = q[recent]
@@ -390,7 +412,7 @@ def depth_band_imbalance(
     bands: dict | None,
     mid: float,
     now_ms: int,
-    reach_usd: float = 200.0,
+    reach_usd: float = BAND_REACH_BANDS * DEPTH_BAND_USD,
 ) -> float:
     """Order-book imbalance from spot depth bands, re-anchored to the live mid.
 
@@ -402,7 +424,7 @@ def depth_band_imbalance(
     recv = int(bands.get("recv_ts_ms") or 0)
     if recv <= 0:
         return 0.0
-    if int(now_ms) > 0 and int(now_ms) - recv > 90_000:
+    if int(now_ms) > 0 and int(now_ms) - recv > BAND_MAX_AGE_MS:
         return 0.0
     anchor = float(bands.get("anchor_price") or 0.0)
     bucket = float(bands.get("bucket_usd") or 0.0)
@@ -526,7 +548,7 @@ def reference_price(spot: dict | None, fut: dict | None) -> float:
     for px in candidates:
         if not math.isfinite(px) or px <= 0.0:
             continue
-        if ref > 0.0 and abs(math.log(px / ref)) > math.log(2.0):
+        if ref > 0.0 and abs(math.log(px / ref)) > math.log(REF_MAX_RATIO):
             continue
         return float(px)
     return ref if ref > 0.0 else 1.0
@@ -555,7 +577,7 @@ def extract(payload: dict) -> dict[str, float]:
     else:
         fut_vol, fut_mom = spot_vol, spot_mom
 
-    vol_1s = 0.6 * spot_vol + 0.4 * fut_vol if fut_vol > 0.0 else spot_vol
+    vol_1s = VOL_SPOT_WEIGHT * spot_vol + (1.0 - VOL_SPOT_WEIGHT) * fut_vol if fut_vol > 0.0 else spot_vol
     mom = 0.5 * spot_mom + 0.5 * fut_mom
 
     s_obi, s_top = depth_imbalances(spot.get("depth_latest"))
@@ -577,10 +599,10 @@ def extract(payload: dict) -> dict[str, float]:
     bands = spot.get("depth_bands") or {}
     bucket = float(bands.get("bucket_usd") or 0.0)
     # Twenty bands is $200 on BTC. The same band count is the reach on every asset.
-    reach = 20.0 * bucket if bucket > 0.0 else 200.0
+    reach = BAND_REACH_BANDS * bucket if bucket > 0.0 else BAND_REACH_BANDS * DEPTH_BAND_USD
     band_imb = depth_band_imbalance(bands, ref, now_ms, reach_usd=reach)
     liq_dir, liq_hour = liquidation_signals(
-        fut.get("liquidations"), now_ms, qty_unit=0.25 / scale, hour_unit=1.0 / scale
+        fut.get("liquidations"), now_ms, qty_unit=LIQ_QTY_UNIT / scale, hour_unit=LIQ_HOUR_UNIT / scale
     )
 
     basis = 0.0
@@ -626,4 +648,6 @@ def extract(payload: dict) -> dict[str, float]:
         "liq_dir": float(liq_dir),
         "liq_hour": float(liq_hour),
         "band_imb": float(band_imb),
+        # Last spot print, 0 when the minute has none.
+        "s_last_trade": float(_last_trade_px(spot.get("trades"))),
     }
