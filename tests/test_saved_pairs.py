@@ -91,6 +91,24 @@ def test_trade_group_emits_the_group_receive_time():
     assert detector.push(1_100, 100.03, 5_200) == 5_080
 
 
+def test_walk_qualifies_two_ticks_from_the_last_move():
+    """One tick from the previous group still qualifies once it is two from the last move."""
+    detector = TradeGroupDetector(0.01)
+    assert detector.push(1_000, 100.00, 5_000) is None
+    assert detector.push(1_100, 100.01, 5_100) is None
+    assert detector.push(1_200, 100.02, 5_200) is None
+    assert detector.push(1_300, 100.02, 5_300) == 5_200
+
+
+def test_one_tick_bounce_is_not_a_move():
+    detector = TradeGroupDetector(0.01)
+    assert detector.push(1_000, 100.00, 5_000) is None
+    assert detector.push(1_100, 100.01, 5_100) is None
+    assert detector.push(1_200, 100.00, 5_200) is None
+    assert detector.push(1_300, 100.01, 5_300) is None
+    assert detector.push(1_400, 100.00, 5_400) is None
+
+
 def test_depth_pair_is_at_or_before_the_anchor():
     snaps = [
         {"recv_ms": 0},

@@ -12,12 +12,15 @@ multiple (200, 400, ...) drops the cycles in between, so a test run writes
 that many times fewer pairs.
 
 ``current_time_ms`` for a time prompt is the asset's slot. A qualifying price
-move is taken with a 50% chance inside the 4-second window that opens 10.25
-seconds after that slot; a miss waits for the next move in the window. The
-window is not stretched, so the mix of clock prompts and event prompts stays
-the live mix. Of the moves that are taken, half are ``event`` (no delay) and
-half are ``event_delayed`` by ``uniform(0, 500 ms)``. The anchor stays the
-move's receive time either way (FAQ.md).
+move is a trade group more than one tick from the last move, not from the
+previous group, so a one-tick walk qualifies once it is two ticks out and a
+one-tick bounce never does. That move is taken with a 50% chance inside the
+4-second window that opens 10.25 seconds after the slot; a miss waits for the
+next move in the window. The window is not stretched, so the mix of clock
+prompts and event prompts stays the live mix. Of the moves that are taken,
+half are ``event`` (no delay) and half are ``event_delayed`` by
+``uniform(0, 500 ms)``. The anchor stays the move's receive time either way
+(FAQ.md).
 
 Each prompt is written under ``database/{asset}/{current_time_ms}/``:
 
@@ -148,7 +151,11 @@ def ms_to_utc(ms: int) -> str:
 
 
 def moved_more_than_one_tick(prev: float, price: float, tick: float) -> bool:
-    """FAQ.md: a trade group that shifts price by more than one tick."""
+    """True when ``price`` is more than one tick from the last move.
+
+    One tick is not enough. Two ticks or more is a move. The caller passes
+    the last qualifying price, not the previous trade group.
+    """
     steps = abs(float(price) - float(prev)) / float(tick)
     return steps > 1.0 + 1e-6
 
@@ -210,17 +217,22 @@ def event_delay_ms(rng: random.Random) -> int:
 
 
 class TradeGroupDetector:
-    """Group trades that share an exchange timestamp, then compare group prices."""
+    """Group same-timestamp trades, then measure the group against the last move.
+
+    The reference price updates only when a group is more than one tick away.
+    A one-tick step from the previous group is ignored until the price is two
+    ticks from that reference. A one-tick bounce never qualifies.
+    """
 
     def __init__(self, tick: float) -> None:
         self.tick = float(tick)
-        self._prev: float | None = None
+        self._last_move: float | None = None
         self._group_ts: int | None = None
         self._group_px: float | None = None
         self._group_recv: int | None = None
 
     def push(self, ts_ms: int, price: float, recv_ms: int) -> int | None:
-        """Return the closed group's receive time when that group moved the price."""
+        """Return the closed group's receive time when that group is a move."""
         ts_ms = int(ts_ms)
         price = float(price)
         recv_ms = int(recv_ms)
@@ -233,18 +245,18 @@ class TradeGroupDetector:
             self._group_px = price
             self._group_recv = recv_ms
             return None
-        prev = self._prev
         group_px = float(self._group_px if self._group_px is not None else price)
         group_recv = int(self._group_recv if self._group_recv is not None else recv_ms)
-        self._prev = group_px
         self._group_ts = ts_ms
         self._group_px = price
         self._group_recv = recv_ms
-        if prev is None:
+        if self._last_move is None:
+            self._last_move = group_px
             return None
-        if moved_more_than_one_tick(prev, group_px, self.tick):
-            return group_recv
-        return None
+        if not moved_more_than_one_tick(self._last_move, group_px, self.tick):
+            return None
+        self._last_move = group_px
+        return group_recv
 
 
 # 1s sampler. A start more than one missed sample off the 60s mark is not usable.
